@@ -7,11 +7,14 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"time"
 )
 
 type OllamaClient struct {
-	endpoint string
-	client   *http.Client
+	endpoint     string
+	client       *http.Client
+	lastError    string
+	extractStats map[string]int // Track extraction success/failure
 }
 
 type ChatMessage struct {
@@ -74,7 +77,10 @@ type ModelShowResponse struct {
 func NewOllamaClient(endpoint string) *OllamaClient {
 	return &OllamaClient{
 		endpoint: strings.TrimSuffix(endpoint, "/"),
-		client:   &http.Client{},
+		client: &http.Client{
+			Timeout: 120 * time.Second, // 2 minute timeout for slow systems
+		},
+		extractStats: make(map[string]int),
 	}
 }
 
@@ -560,15 +566,139 @@ Category:`, userMsg, assistantMsg)
 
 // ExtractEntitySheets extracts structured entity information (characters, locations, etc.)
 func (c *OllamaClient) ExtractEntitySheets(model, userMsg, assistantMsg string) ([]EntitySheetResult, error) {
-	prompt := fmt.Sprintf(`Extract ALL entities (characters, locations, items, rules, etc.) from this Q&A.
-For EACH entity, create a structured sheet with:
-- entity_name: the name/title
-- entity_type: character, location, item, rule, concept, etc.
-- description: complete description
-- attributes: key-value pairs of all attributes (appearance, abilities, stats, etc.)
-- keywords: searchable terms
+	prompt := fmt.Sprintf(`Extract ALL named entities from this conversation as a JSON array.
 
-Return ONLY a JSON array of entity sheets. No explanation.
+For EACH entity (location, character, item, etc.), create an object with:
+- entity_name: The proper name
+- entity_type: "location", "character", "item", etc.
+- description: Complete description
+- attributes: MUST be a JSON object (not a string), like {"key": "value", "key2": "value2"}
+- keywords: Array of searchable terms
+
+CRITICAL: "attributes" MUST be an object with key-value pairs, NOT a string.
+
+Example:
+[
+  {
+    "entity_name": "The Red Tavern",
+    "entity_type": "location",
+    "description": "A bustling tavern in the merchant district with a large fireplace",
+    "attributes": {
+      "atmosphere": "warm and crowded",
+      "location": "merchant district",
+      "features": "large fireplace, private rooms upstairs"
+    },
+    "keywords": ["tavern", "red", "merchant", "inn", "fireplace"]
+  }
+]
+
+If there are no specific key-value attributes, use: "attributes": {}
+
+Q: %s
+A: %s
+
+Return ONLY the JSON array, no explanation:`, userMsg, assistantMsg)
+
+	chatMessages := []ChatMessage{
+		{Role: "user", Content: prompt},
+	}
+
+	response, err := c.Chat(model, chatMessages)
+	if err != nil {
+		return nil, err
+	}
+
+	response = strings.TrimSpace(response)
+
+	// Try to extract JSON from response (handle markdown code blocks, extra text, etc.)
+	jsonStr := extractJSON(response, true) // true = expect array
+	if jsonStr == "" {
+		c.lastError = fmt.Sprintf("ExtractEntitySheets: No JSON found in response: %s", response[:min(200, len(response))])
+		c.extractStats["entity_sheets_failed"]++
+		return nil, nil
+	}
+
+	var result []EntitySheetResult
+	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
+		// Store error for debugging
+		c.lastError = fmt.Sprintf("ExtractEntitySheets JSON parse error: %v | JSON: %s", err, jsonStr[:min(200, len(jsonStr))])
+		c.extractStats["entity_sheets_failed"]++
+		return nil, nil
+	}
+
+	c.extractStats["entity_sheets_success"]++
+	return result, nil
+}
+
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+// extractJSON robustly extracts JSON from LLM responses
+// Handles: markdown code blocks (```json), extra text, explanations
+func extractJSON(response string, expectArray bool) string {
+	response = strings.TrimSpace(response)
+
+	// Remove markdown code blocks
+	if strings.Contains(response, "```") {
+		// Extract content between ```json and ``` or ``` and ```
+		start := strings.Index(response, "```json")
+		if start == -1 {
+			start = strings.Index(response, "```")
+		}
+		if start != -1 {
+			start = strings.Index(response[start:], "\n")
+			if start != -1 {
+				response = response[start+1:]
+				end := strings.Index(response, "```")
+				if end != -1 {
+					response = response[:end]
+				}
+			}
+		}
+	}
+
+	response = strings.TrimSpace(response)
+
+	// Find JSON structure
+	if expectArray {
+		startIdx := strings.Index(response, "[")
+		endIdx := strings.LastIndex(response, "]")
+		if startIdx != -1 && endIdx != -1 && endIdx > startIdx {
+			return response[startIdx : endIdx+1]
+		}
+	} else {
+		startIdx := strings.Index(response, "{")
+		endIdx := strings.LastIndex(response, "}")
+		if startIdx != -1 && endIdx != -1 && endIdx > startIdx {
+			return response[startIdx : endIdx+1]
+		}
+	}
+
+	return ""
+}
+
+// ExtractStructuredQA extracts who/what/why/when/where/how structure
+func (c *OllamaClient) ExtractStructuredQA(model, userMsg, assistantMsg string) (*StructuredQAResult, error) {
+	prompt := fmt.Sprintf(`Extract key information from this Q&A using the 5W1H framework.
+
+Fill in ALL applicable fields. For location descriptions, focus on spatial details in "where" and environmental details in "what".
+
+Return ONLY valid JSON in this exact format:
+{
+  "who": "people/characters/entities involved or mentioned",
+  "what": "what is described, happening, or exists",
+  "why": "purpose, significance, or reason",
+  "when": "time period, era, or temporal context",
+  "where": "location, place, or spatial relationships",
+  "how": "mechanism, structure, or process",
+  "keywords": ["searchable", "terms", "from", "content"]
+}
+
+Use empty string "" for fields that don't apply.
 
 Q: %s
 A: %s
@@ -584,41 +714,151 @@ JSON:`, userMsg, assistantMsg)
 		return nil, err
 	}
 
-	response = strings.TrimSpace(response)
-	startIdx := strings.Index(response, "[")
-	endIdx := strings.LastIndex(response, "]")
-
-	if startIdx == -1 || endIdx == -1 {
+	jsonStr := extractJSON(response, false) // false = expect object
+	if jsonStr == "" {
+		c.lastError = fmt.Sprintf("ExtractStructuredQA: No JSON found in response: %s", response[:min(200, len(response))])
+		c.extractStats["structured_qa_failed"]++
 		return nil, nil
 	}
 
-	jsonStr := response[startIdx : endIdx+1]
-
-	var result []EntitySheetResult
+	var result StructuredQAResult
 	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
+		c.lastError = fmt.Sprintf("ExtractStructuredQA JSON parse error: %v | JSON: %s", err, jsonStr[:min(200, len(jsonStr))])
+		c.extractStats["structured_qa_failed"]++
 		return nil, nil
 	}
 
-	return result, nil
+	c.extractStats["structured_qa_success"]++
+	return &result, nil
 }
 
-// ExtractStructuredQA extracts who/what/why/when/where/how structure
-func (c *OllamaClient) ExtractStructuredQA(model, userMsg, assistantMsg string) (*StructuredQAResult, error) {
-	prompt := fmt.Sprintf(`Analyze this Q&A and extract structured information:
-- who: entities involved
-- what: what is being described or happening
-- why: purpose, reason, motivation
-- when: temporal context if any
-- where: location, spatial context if any
-- how: mechanics, process, method
-- keywords: searchable terms
+// ExtractKeyValuePairs extracts key-value mappings for entity registry
+func (c *OllamaClient) ExtractKeyValuePairs(model, userMsg, assistantMsg string) ([]KeyValuePair, error) {
+	prompt := fmt.Sprintf(`Extract entity registry entries as key-value pairs.
 
-Return ONLY a JSON object. Use empty string if field doesn't apply.
+For EACH named thing (person, place, item, concept), create an entry:
+- key: The proper name (e.g., "The Broken Tower", "Aria the Merchant")
+- value: Complete description with ALL details mentioned
+- keywords: Searchable terms including synonyms and related concepts
+
+Examples:
+Location: {"key": "The Whispering Woods", "value": "Dark forest north of town, known for strange sounds at night", "keywords": ["woods", "forest", "whispering", "dark", "haunted"]}
+Character: {"key": "Lord Vex", "value": "Cruel ruler of the northern provinces, wears black armor", "keywords": ["vex", "lord", "ruler", "northern", "armor", "cruel"]}
+
+Return ONLY a JSON array with ALL entities found:
 
 Q: %s
 A: %s
 
-JSON:`, userMsg, assistantMsg)
+JSON array:`, userMsg, assistantMsg)
+
+	chatMessages := []ChatMessage{
+		{Role: "user", Content: prompt},
+	}
+
+	response, err := c.Chat(model, chatMessages)
+	if err != nil {
+		return nil, err
+	}
+
+	jsonStr := extractJSON(response, true) // true = expect array
+	if jsonStr == "" {
+		c.lastError = fmt.Sprintf("ExtractKeyValuePairs: No JSON found in response: %s", response[:min(200, len(response))])
+		c.extractStats["kv_pairs_failed"]++
+		return nil, nil
+	}
+
+	var result []KeyValuePair
+	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
+		c.lastError = fmt.Sprintf("ExtractKeyValuePairs JSON parse error: %v | JSON: %s", err, jsonStr[:min(200, len(jsonStr))])
+		c.extractStats["kv_pairs_failed"]++
+		return nil, nil
+	}
+
+	c.extractStats["kv_pairs_success"]++
+	return result, nil
+}
+
+// CanonicalQA represents canonical question-answer pairs extracted from content
+type CanonicalQA struct {
+	Question string `json:"question"`
+	Answer   string `json:"answer"`
+}
+
+// ExtractCanonicalQA extracts canonical Q&A pairs from conversation
+// Example: "who is the beggar" becomes "Who is The Beggar of Somewhere?"
+func (c *OllamaClient) ExtractCanonicalQA(model, userMsg, assistantMsg string) ([]CanonicalQA, error) {
+	prompt := fmt.Sprintf(`Create canonical question-answer pairs from this conversation.
+
+For EACH fact, entity, or concept mentioned, create a well-formed Q&A:
+- Use proper capitalization and punctuation
+- Questions should be complete and specific
+- Answers should be concise but complete
+- Include variations: "What is X?", "Where is X?", "Who is X?", "What does X do?"
+
+Examples:
+User asks: "tell me about the tower"
+→ [{"question": "What is the tower?", "answer": "An ancient stone tower on the hill"}]
+
+User asks: "where is the market"
+→ [{"question": "Where is the market?", "answer": "In the center of town, near the fountain"}]
+
+Return ONLY a JSON array. Extract 2-5 Q&A pairs covering all key information:
+
+Q: %s
+A: %s
+
+JSON array:`, userMsg, assistantMsg)
+
+	chatMessages := []ChatMessage{
+		{Role: "user", Content: prompt},
+	}
+
+	response, err := c.Chat(model, chatMessages)
+	if err != nil {
+		return nil, err
+	}
+
+	jsonStr := extractJSON(response, true) // true = expect array
+	if jsonStr == "" {
+		c.lastError = fmt.Sprintf("ExtractCanonicalQA: No JSON found in response: %s", response[:min(200, len(response))])
+		c.extractStats["canonical_qa_failed"]++
+		return nil, nil
+	}
+
+	var result []CanonicalQA
+	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
+		c.lastError = fmt.Sprintf("ExtractCanonicalQA JSON parse error: %v | JSON: %s", err, jsonStr[:min(200, len(jsonStr))])
+		c.extractStats["canonical_qa_failed"]++
+		return nil, nil
+	}
+
+	c.extractStats["canonical_qa_success"]++
+	return result, nil
+}
+
+// QueryEnhancement represents an enhanced query with extracted entities
+type QueryEnhancement struct {
+	OriginalQuery      string   `json:"original_query"`
+	EnhancedQueries    []string `json:"enhanced_queries"`
+	ExtractedEntities  []string `json:"extracted_entities"`
+	CanonicalForm      string   `json:"canonical_form"`
+}
+
+// EnhanceQuery extracts entities and reformulates queries for better matching
+func (c *OllamaClient) EnhanceQuery(model, query string) (*QueryEnhancement, error) {
+	prompt := fmt.Sprintf(`Analyze this query and enhance it for semantic search.
+Extract entities, create canonical form, and generate alternative phrasings.
+
+Return ONLY a JSON object with:
+- original_query: the input query
+- enhanced_queries: array of alternative phrasings (3-5 variations)
+- extracted_entities: array of key entities/concepts
+- canonical_form: well-formed question with proper capitalization
+
+Query: %s
+
+JSON:`, query)
 
 	chatMessages := []ChatMessage{
 		{Role: "user", Content: prompt},
@@ -639,7 +879,7 @@ JSON:`, userMsg, assistantMsg)
 
 	jsonStr := response[startIdx : endIdx+1]
 
-	var result StructuredQAResult
+	var result QueryEnhancement
 	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
 		return nil, nil
 	}
@@ -647,20 +887,40 @@ JSON:`, userMsg, assistantMsg)
 	return &result, nil
 }
 
-// ExtractKeyValuePairs extracts key-value mappings for entity registry
-func (c *OllamaClient) ExtractKeyValuePairs(model, userMsg, assistantMsg string) ([]KeyValuePair, error) {
-	prompt := fmt.Sprintf(`Extract ALL key-value pairs from this Q&A.
-For each entity, concept, or fact, create:
-- key: the name/identifier (e.g., "The Beggar of Somewhere")
-- value: the complete information about it
-- keywords: searchable terms
+// QuestionKeyPair represents a generated question mapped to content
+type QuestionKeyPair struct {
+	Question string `json:"question"`
+	Keywords []string `json:"keywords"`
+}
 
-Return ONLY a JSON array. Create as many pairs as entities/concepts exist.
+// ExtractQuestionKeys generates questions that would lead to this content
+func (c *OllamaClient) ExtractQuestionKeys(model, userMsg, assistantMsg string) ([]QuestionKeyPair, error) {
+	prompt := fmt.Sprintf(`Read this conversation and generate questions that someone might ask to retrieve this information.
 
-Q: %s
-A: %s
+Think: "If someone wanted to find this content, what would they ask?"
 
-JSON:`, userMsg, assistantMsg)
+Create 3-7 diverse questions covering:
+- Direct questions about the main topic
+- Questions about specific details mentioned
+- Questions using different phrasings
+- Questions from different perspectives
+
+Return ONLY a JSON array:
+[
+  {
+    "question": "What is the Tower of Nothingness?",
+    "keywords": ["tower", "nothingness", "location"]
+  },
+  {
+    "question": "Where can I find the Tower of Nothingness?",
+    "keywords": ["tower", "location", "find"]
+  }
+]
+
+User asked: %s
+Assistant answered: %s
+
+JSON array:`, userMsg, assistantMsg)
 
 	chatMessages := []ChatMessage{
 		{Role: "user", Content: prompt},
@@ -671,20 +931,36 @@ JSON:`, userMsg, assistantMsg)
 		return nil, err
 	}
 
-	response = strings.TrimSpace(response)
-	startIdx := strings.Index(response, "[")
-	endIdx := strings.LastIndex(response, "]")
-
-	if startIdx == -1 || endIdx == -1 {
+	jsonStr := extractJSON(response, true)
+	if jsonStr == "" {
+		c.lastError = fmt.Sprintf("ExtractQuestionKeys: No JSON found in response: %s", response[:min(200, len(response))])
+		c.extractStats["question_keys_failed"]++
 		return nil, nil
 	}
 
-	jsonStr := response[startIdx : endIdx+1]
-
-	var result []KeyValuePair
+	var result []QuestionKeyPair
 	if err := json.Unmarshal([]byte(jsonStr), &result); err != nil {
+		c.lastError = fmt.Sprintf("ExtractQuestionKeys JSON parse error: %v | JSON: %s", err, jsonStr[:min(200, len(jsonStr))])
+		c.extractStats["question_keys_failed"]++
 		return nil, nil
 	}
 
+	c.extractStats["question_keys_success"]++
 	return result, nil
+}
+
+// GetExtractionStats returns statistics about LLM extraction success/failure
+func (c *OllamaClient) GetExtractionStats() map[string]int {
+	return c.extractStats
+}
+
+// GetLastError returns the last extraction error for debugging
+func (c *OllamaClient) GetLastError() string {
+	return c.lastError
+}
+
+// ResetExtractionStats clears the extraction statistics
+func (c *OllamaClient) ResetExtractionStats() {
+	c.extractStats = make(map[string]int)
+	c.lastError = ""
 }

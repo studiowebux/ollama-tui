@@ -8,9 +8,9 @@ import (
 )
 
 func main() {
-	storage, err := NewStorage()
+	projectManager, err := NewProjectManager()
 	if err != nil {
-		fmt.Printf("Error initializing storage: %v\n", err)
+		fmt.Printf("Error initializing project manager: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -20,7 +20,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	vectorDB, err := NewVectorDB()
+	storage, err := NewStorage(projectManager, config.CurrentProject)
+	if err != nil {
+		fmt.Printf("Error initializing storage: %v\n", err)
+		os.Exit(1)
+	}
+
+	vectorDB, err := NewVectorDB(projectManager, config.CurrentProject)
 	if err != nil {
 		fmt.Printf("Error initializing vector DB: %v\n", err)
 		os.Exit(1)
@@ -29,7 +35,7 @@ func main() {
 	client := NewOllamaClient(config.Endpoint)
 
 	p := tea.NewProgram(
-		initialModel(storage, client, config, vectorDB),
+		initialModel(storage, client, config, vectorDB, projectManager),
 		tea.WithAltScreen(),
 	)
 

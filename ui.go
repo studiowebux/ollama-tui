@@ -19,6 +19,11 @@ const (
 	settingsView
 	vectorStatsView
 	confirmResetView
+	projectSwitcherView
+	knowledgeBaseView
+	chunkDetailView
+	refineChunkView
+	refineDiffView
 )
 
 type model struct {
@@ -26,9 +31,19 @@ type model struct {
 	client            *OllamaClient
 	config            *Config
 	vectorDB          *VectorDB
+	projectManager    *ProjectManager
 	currentView       view
 	currentChat       *Chat
 	chats             []*Chat
+	projects          []*Project
+	projectCursor     int
+	kbChunks          []VectorChunk
+	kbCursor          int
+	selectedChunk     *VectorChunk
+	originalChunk     *VectorChunk
+	refinedContent    string
+	refineMessages    []string
+	refineRoles       []string
 	textarea          textarea.Model
 	viewport          viewport.Model
 	messages          []string
@@ -37,6 +52,7 @@ type model struct {
 	summarizing       bool
 	vectorizing       bool
 	vectorProgress    string
+	vectorProgressChan chan tea.Msg
 	err               error
 	width             int
 	height            int
@@ -67,6 +83,7 @@ type streamStartMsg struct {
 type errMsg struct{ err error }
 type contextSizeMsg int
 type resetCompleteMsg struct{}
+type vectorizeStepMsg struct{ step string }
 
 var (
 	titleStyle = lipgloss.NewStyle().
@@ -92,7 +109,7 @@ var (
 			Foreground(lipgloss.Color("243"))
 )
 
-func initialModel(storage *Storage, client *OllamaClient, config *Config, vectorDB *VectorDB) model {
+func initialModel(storage *Storage, client *OllamaClient, config *Config, vectorDB *VectorDB, pm *ProjectManager) model {
 	ta := textarea.New()
 	ta.Placeholder = "Type your message..."
 	ta.Focus()
@@ -118,11 +135,12 @@ func initialModel(storage *Storage, client *OllamaClient, config *Config, vector
 	vp.SetContent("")
 
 	return model{
-		storage:       storage,
-		client:        client,
-		config:        config,
-		vectorDB:      vectorDB,
-		currentView:   chatListView,
+		storage:        storage,
+		client:         client,
+		config:         config,
+		vectorDB:       vectorDB,
+		projectManager: pm,
+		currentView:    chatListView,
 		textarea:      ta,
 		viewport:      vp,
 		messages:      []string{},
@@ -157,6 +175,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleSettingsViewKeys(msg)
 		case vectorStatsView:
 			return m.handleVectorStatsViewKeys(msg)
+		case projectSwitcherView:
+			return m.handleProjectSwitcherViewKeys(msg)
+		case knowledgeBaseView:
+			return m.handleKnowledgeBaseViewKeys(msg)
+		case chunkDetailView:
+			return m.handleChunkDetailViewKeys(msg)
+		case refineChunkView:
+			return m.handleRefineChunkViewKeys(msg)
+		case refineDiffView:
+			return m.handleRefineDiffViewKeys(msg)
 		case confirmResetView:
 			return m.handleConfirmResetViewKeys(msg)
 		}
@@ -209,13 +237,42 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case vectorizeStartMsg:
+		m.vectorizing = true
+		m.vectorProgress = "Starting..."
+		return m, m.doVectorize()
+
+	case vectorizeStepMsg:
+		m.vectorProgress = msg.step
+		// Continue listening for more progress messages
+		return m, m.waitForVectorProgress
+
 	case vectorizeProgressMsg:
-		m.vectorProgress = fmt.Sprintf("%d/%d", msg.current, msg.total)
-		return m, nil
+		m.vectorProgress = fmt.Sprintf("Pair %d/%d", msg.current, msg.total)
+		// Continue listening for more progress messages
+		return m, m.waitForVectorProgress
 
 	case vectorizeMsg:
 		m.vectorizing = false
 		m.vectorProgress = ""
+		if m.vectorProgressChan != nil {
+			close(m.vectorProgressChan)
+			m.vectorProgressChan = nil
+		}
+		return m, nil
+
+	case switchProjectMsg:
+		m.currentView = chatListView
+		return m, m.loadChats
+
+	case refineResponseMsg:
+		m.refineMessages = append(m.refineMessages, msg.response)
+		m.refineRoles = append(m.refineRoles, "assistant")
+		return m, nil
+
+	case refineGenerateMsg:
+		m.refinedContent = msg.content
+		m.currentView = refineDiffView
 		return m, nil
 
 	case summarizeMsg:
@@ -268,6 +325,16 @@ func (m model) View() string {
 		return m.renderVectorStatsView()
 	case confirmResetView:
 		return m.renderConfirmResetView()
+	case projectSwitcherView:
+		return m.renderProjectSwitcherView()
+	case knowledgeBaseView:
+		return m.renderKnowledgeBaseView()
+	case chunkDetailView:
+		return m.renderChunkDetailView()
+	case refineChunkView:
+		return m.renderRefineChunkView()
+	case refineDiffView:
+		return m.renderRefineDiffView()
 	}
 	return ""
 }
@@ -326,9 +393,13 @@ func (m model) renderChatView() string {
 }
 
 func (m model) renderChatListView() string {
-	title := titleStyle.Render("Chat History")
+	projectName := "default"
+	if project := m.projectManager.GetProject(m.config.CurrentProject); project != nil {
+		projectName = project.Name
+	}
+	title := titleStyle.Render(fmt.Sprintf("Chat History - Project: %s", projectName))
 	modelInfo := helpStyle.Render(fmt.Sprintf("Current model: %s", m.config.Model))
-	help := helpStyle.Render("↑/↓: navigate | enter: open | n: new chat | d: delete | s: settings | v: vector stats | r: reset all | q: quit")
+	help := helpStyle.Render("↑/↓: navigate | enter: open | n: new chat | d: delete | p: projects | k: knowledge base | s: settings | v: vector stats | r: reset all | q: quit")
 
 	var content strings.Builder
 	content.WriteString(title + " - " + modelInfo + "\n\n")
@@ -520,12 +591,12 @@ func (m *model) handleChatListViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q", "ctrl+c":
 		return m, tea.Quit
 
-	case "up", "k":
+	case "up":
 		if m.chatListCursor > 0 {
 			m.chatListCursor--
 		}
 
-	case "down", "j":
+	case "down":
 		if m.chatListCursor < len(m.chats)-1 {
 			m.chatListCursor++
 		}
@@ -564,6 +635,19 @@ func (m *model) handleChatListViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "v":
 		m.currentView = vectorStatsView
+		return m, nil
+
+	case "p":
+		m.projects = m.projectManager.ListProjects()
+		m.projectCursor = 0
+		m.currentView = projectSwitcherView
+		return m, nil
+
+	case "k":
+		m.kbChunks = m.vectorDB.GetAllChunks()
+		sortChunksByTime(m.kbChunks)
+		m.kbCursor = 0
+		m.currentView = knowledgeBaseView
 		return m, nil
 
 	case "r":
@@ -826,6 +910,7 @@ type summarizeMsg struct {
 }
 
 type vectorizeMsg struct{}
+type vectorizeStartMsg struct{}
 type vectorizeProgressMsg struct {
 	current int
 	total   int
@@ -838,25 +923,46 @@ func (m *model) vectorizeChat() tea.Cmd {
 		}
 	}
 
-	m.vectorizing = true
-
 	return func() tea.Msg {
-		cleanedMessages := make([]Message, len(m.currentChat.Messages))
-		for i, msg := range m.currentChat.Messages {
-			cleanedMessages[i] = Message{
-				Role:      msg.Role,
-				Content:   stripThinkingTags(msg.Content),
-				Timestamp: msg.Timestamp,
-			}
-		}
+		return vectorizeStartMsg{}
+	}
+}
 
-		// Vectorize conversation
-		if err := m.vectorizeConversation(cleanedMessages, nil); err != nil {
-			return errMsg{err: fmt.Errorf("vectorization failed: %w", err)}
+func (m *model) doVectorize() tea.Cmd {
+	cleanedMessages := make([]Message, len(m.currentChat.Messages))
+	for i, msg := range m.currentChat.Messages {
+		cleanedMessages[i] = Message{
+			Role:      msg.Role,
+			Content:   stripThinkingTags(msg.Content),
+			Timestamp: msg.Timestamp,
 		}
+	}
 
+	// Create progress channel and store it
+	m.vectorProgressChan = make(chan tea.Msg, 100)
+
+	// Start vectorization in background
+	go func() {
+		if err := m.vectorizeConversation(cleanedMessages, m.vectorProgressChan); err != nil {
+			m.vectorProgressChan <- errMsg{err: fmt.Errorf("vectorization failed: %w", err)}
+		} else {
+			m.vectorProgressChan <- vectorizeMsg{}
+		}
+	}()
+
+	// Return a command that waits for the next progress message
+	return m.waitForVectorProgress
+}
+
+func (m *model) waitForVectorProgress() tea.Msg {
+	if m.vectorProgressChan == nil {
+		return nil
+	}
+	msg, ok := <-m.vectorProgressChan
+	if !ok {
 		return vectorizeMsg{}
 	}
+	return msg
 }
 
 func (m *model) summarizeChat() tea.Cmd {
@@ -1051,9 +1157,12 @@ func (m *model) vectorizeConversation(messages []Message, progressChan chan<- te
 		content := fmt.Sprintf("Q: %s\nA: %s", userMsg.Content, assistantMsg.Content)
 		mainChunkID := ""
 
-		// Detect content type first
+		// Detect content type first (skip in light mode to save LLM calls)
 		contentType := ContentType("dialog")
-		if m.config.VectorExtractMetadata {
+		if m.config.VectorExtractMetadata && !m.config.VectorLightMode {
+			if progressChan != nil {
+				progressChan <- vectorizeStepMsg{step: "Detecting content type"}
+			}
 			detectedType, _ := m.client.DetectContentType(m.config.Model, userMsg.Content, assistantMsg.Content)
 			if detectedType != "" {
 				contentType = ContentType(detectedType)
@@ -1061,6 +1170,9 @@ func (m *model) vectorizeConversation(messages []Message, progressChan chan<- te
 		}
 
 		// STRATEGY 1: Create main full Q&A chunk
+		if progressChan != nil {
+			progressChan <- vectorizeStepMsg{step: "Creating full Q&A chunk"}
+		}
 		embedding, err := m.client.GenerateEmbedding(m.config.VectorModel, content)
 		if err != nil {
 			return err
@@ -1093,6 +1205,9 @@ func (m *model) vectorizeConversation(messages []Message, progressChan chan<- te
 
 		// ALWAYS apply sentence-level chunking (doesn't require LLM extraction)
 		// STRATEGY 2: Sentence-level chunking for long responses
+		if progressChan != nil {
+			progressChan <- vectorizeStepMsg{step: "Chunking sentences"}
+		}
 		sentences := strings.Split(assistantMsg.Content, ". ")
 		if len(sentences) > 1 {
 			for idx, sentence := range sentences {
@@ -1130,8 +1245,12 @@ func (m *model) vectorizeConversation(messages []Message, progressChan chan<- te
 
 		// Apply advanced extraction strategies if enabled
 		if m.config.VectorExtractMetadata {
-			// STRATEGY 3: Extract structured who/what/why/when/where/how
-			if structuredQA, err := m.client.ExtractStructuredQA(m.config.Model, userMsg.Content, assistantMsg.Content); err == nil && structuredQA != nil {
+			// STRATEGY 3: Extract structured who/what/why/when/where/how (skip in light mode)
+			if !m.config.VectorLightMode {
+				if progressChan != nil {
+					progressChan <- vectorizeStepMsg{step: "Extracting structured Q&A"}
+				}
+				if structuredQA, err := m.client.ExtractStructuredQA(m.config.Model, userMsg.Content, assistantMsg.Content); err == nil && structuredQA != nil {
 				qaContent := fmt.Sprintf("Who: %s\nWhat: %s\nWhy: %s\nWhen: %s\nWhere: %s\nHow: %s",
 					structuredQA.Who, structuredQA.What, structuredQA.Why, structuredQA.When, structuredQA.Where, structuredQA.How)
 
@@ -1160,9 +1279,13 @@ func (m *model) vectorizeConversation(messages []Message, progressChan chan<- te
 						relatedIDs = append(relatedIDs, qaChunk.ID)
 					}
 				}
+				}
 			}
 
-			// STRATEGY 3: Extract key-value pairs (entity registry)
+			// STRATEGY 4: Extract key-value pairs (entity registry) - ALWAYS run, even in light mode
+			if progressChan != nil {
+				progressChan <- vectorizeStepMsg{step: "Extracting key-value pairs"}
+			}
 			if kvPairs, err := m.client.ExtractKeyValuePairs(m.config.Model, userMsg.Content, assistantMsg.Content); err == nil && len(kvPairs) > 0 {
 				for _, kv := range kvPairs {
 					kvContent := fmt.Sprintf("%s: %s", kv.Key, kv.Value)
@@ -1190,8 +1313,11 @@ func (m *model) vectorizeConversation(messages []Message, progressChan chan<- te
 				}
 			}
 
-			// STRATEGY 4: Extract entity sheets for fictional content
-			if contentType == ContentTypeFictional {
+			// STRATEGY 5: Extract entity sheets for fictional content (skip in light mode)
+			if contentType == ContentTypeFictional && !m.config.VectorLightMode {
+				if progressChan != nil {
+					progressChan <- vectorizeStepMsg{step: "Extracting entity sheets"}
+				}
 				if entities, err := m.client.ExtractEntitySheets(m.config.Model, userMsg.Content, assistantMsg.Content); err == nil && len(entities) > 0 {
 					for _, entity := range entities {
 						sheetContent := fmt.Sprintf("%s (%s): %s", entity.EntityName, entity.EntityType, entity.Description)
@@ -1225,11 +1351,65 @@ func (m *model) vectorizeConversation(messages []Message, progressChan chan<- te
 				}
 			}
 
+			// STRATEGY 6: Extract canonical Q&A pairs - ALWAYS run, even in light mode
+			if progressChan != nil {
+				progressChan <- vectorizeStepMsg{step: "Extracting canonical Q&A"}
+			}
+			if canonicalQAs, err := m.client.ExtractCanonicalQA(m.config.Model, userMsg.Content, assistantMsg.Content); err == nil && len(canonicalQAs) > 0 {
+				// Store canonical questions in the main chunk
+				if mainChunk := m.vectorDB.GetChunkByID(mainChunkID); mainChunk != nil {
+					questions := make([]string, len(canonicalQAs))
+					for i, qa := range canonicalQAs {
+						questions[i] = qa.Question
+					}
+					mainChunk.CanonicalQuestions = questions
+					mainChunk.CanonicalAnswer = canonicalQAs[0].Answer // Use first answer as primary
+					m.vectorDB.saveChunk(*mainChunk)
+				}
+			}
+
+			// STRATEGY 7: Question-as-key chunks - ALWAYS run
+			// Generate questions that would lead to this content
+			if progressChan != nil {
+				progressChan <- vectorizeStepMsg{step: "Generating question keys"}
+			}
+			if questionKeys, err := m.client.ExtractQuestionKeys(m.config.Model, userMsg.Content, assistantMsg.Content); err == nil && len(questionKeys) > 0 {
+				// Create a separate chunk for each generated question
+				// The question is the searchable content, full answer is referenced
+				for _, qk := range questionKeys {
+					qkContent := qk.Question
+					if qkEmbed, err := m.client.GenerateEmbedding(m.config.VectorModel, qkContent); err == nil {
+						qkChunk := VectorChunk{
+							ChatID:      m.currentChat.ID,
+							Content:     qkContent, // Question is the searchable content
+							ContentType: contentType,
+							Strategy:    StrategyQuestionKey,
+							Embedding:   qkEmbed,
+							Metadata: ChunkMetadata{
+								UserMessage:      userMsg.Content,
+								AssistantMessage: assistantMsg.Content, // Full content stored here
+								Timestamp:        userMsg.Timestamp,
+								ParentChunkID:    mainChunkID,
+								SearchKeywords:   qk.Keywords,
+								OriginalText:     assistantMsg.Content,
+							},
+						}
+						// Store canonical question/answer pair
+						qkChunk.CanonicalQuestions = []string{qk.Question}
+						qkChunk.CanonicalAnswer = assistantMsg.Content
+
+						if err := m.vectorDB.AddChunk(qkChunk); err == nil {
+							relatedIDs = append(relatedIDs, qkChunk.ID)
+						}
+					}
+				}
+			}
 		}
 
 		// Link all sub-chunks to main chunk
 		if mainChunk := m.vectorDB.GetChunkByID(mainChunkID); mainChunk != nil {
 			mainChunk.Metadata.RelatedChunkIDs = relatedIDs
+			m.vectorDB.saveChunk(*mainChunk)
 		}
 	}
 
@@ -1247,14 +1427,59 @@ func (m *model) retrieveRelevantContext(query string) (string, error) {
 		return "", nil
 	}
 
-	embedding, err := m.client.GenerateEmbedding(m.config.VectorModel, query)
-	if err != nil {
-		m.lastVectorDebug = fmt.Sprintf("[Vector Error: %v]", err)
-		return "", err
+	// Enhance query if explicitly enabled (disabled by default for speed)
+	var searchQueries []string
+	searchQueries = append(searchQueries, query)
+
+	if m.config.VectorEnhanceQuery {
+		if enhancement, err := m.client.EnhanceQuery(m.config.Model, query); err == nil && enhancement != nil {
+			// Add canonical form
+			if enhancement.CanonicalForm != "" {
+				searchQueries = append(searchQueries, enhancement.CanonicalForm)
+			}
+			// Add enhanced queries (limit to 2 most relevant)
+			for i, eq := range enhancement.EnhancedQueries {
+				if i >= 2 {
+					break
+				}
+				searchQueries = append(searchQueries, eq)
+			}
+		}
 	}
 
-	// Use hybrid search for better keyword matching with fictional content
-	results := m.vectorDB.SearchHybrid(embedding, query, m.config.VectorTopK*2)
+	// Search with all query variations and combine results
+	allResults := make(map[string]SearchResult)
+
+	for _, sq := range searchQueries {
+		embedding, err := m.client.GenerateEmbedding(m.config.VectorModel, sq)
+		if err != nil {
+			continue
+		}
+
+		// Use hybrid search for better keyword matching
+		results := m.vectorDB.SearchHybrid(embedding, sq, m.config.VectorTopK*2)
+
+		// Merge results, keeping highest similarity score for each chunk
+		for _, result := range results {
+			if existing, ok := allResults[result.Chunk.ID]; !ok || result.Similarity > existing.Similarity {
+				allResults[result.Chunk.ID] = result
+			}
+		}
+	}
+
+	// Convert map to slice and sort by similarity
+	results := make([]SearchResult, 0, len(allResults))
+	for _, result := range allResults {
+		results = append(results, result)
+	}
+	sort.Slice(results, func(i, j int) bool {
+		return results[i].Similarity > results[j].Similarity
+	})
+
+	// Limit to initial topK
+	if len(results) > m.config.VectorTopK*2 {
+		results = results[:m.config.VectorTopK*2]
+	}
 
 	// Optionally expand with related chunks
 	if m.config.VectorIncludeRelated && len(results) > 0 {
@@ -1404,6 +1629,53 @@ func (m model) renderVectorStatsView() string {
 		relatedStatus = lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Render("ON")
 	}
 	content.WriteString(fmt.Sprintf("  Include Related Chunks: %s\n\n", relatedStatus))
+
+	// Extraction stats
+	extractStats := m.client.GetExtractionStats()
+	if len(extractStats) > 0 {
+		content.WriteString(helpStyle.Render("Extraction Statistics:") + "\n")
+
+		totalSuccess := extractStats["structured_qa_success"] + extractStats["kv_pairs_success"] +
+			extractStats["entity_sheets_success"] + extractStats["canonical_qa_success"] + extractStats["question_keys_success"]
+		totalFailed := extractStats["structured_qa_failed"] + extractStats["kv_pairs_failed"] +
+			extractStats["entity_sheets_failed"] + extractStats["canonical_qa_failed"] + extractStats["question_keys_failed"]
+
+		successStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("86"))
+		failStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+
+		content.WriteString(fmt.Sprintf("  Total: %s / %s\n",
+			successStyle.Render(fmt.Sprintf("%d success", totalSuccess)),
+			failStyle.Render(fmt.Sprintf("%d failed", totalFailed))))
+
+		if extractStats["structured_qa_success"] > 0 || extractStats["structured_qa_failed"] > 0 {
+			content.WriteString(fmt.Sprintf("  Structured Q&A: %d / %d\n",
+				extractStats["structured_qa_success"], extractStats["structured_qa_failed"]))
+		}
+		if extractStats["kv_pairs_success"] > 0 || extractStats["kv_pairs_failed"] > 0 {
+			content.WriteString(fmt.Sprintf("  Key-Value Pairs: %d / %d\n",
+				extractStats["kv_pairs_success"], extractStats["kv_pairs_failed"]))
+		}
+		if extractStats["entity_sheets_success"] > 0 || extractStats["entity_sheets_failed"] > 0 {
+			content.WriteString(fmt.Sprintf("  Entity Sheets: %d / %d\n",
+				extractStats["entity_sheets_success"], extractStats["entity_sheets_failed"]))
+		}
+		if extractStats["canonical_qa_success"] > 0 || extractStats["canonical_qa_failed"] > 0 {
+			content.WriteString(fmt.Sprintf("  Canonical Q&A: %d / %d\n",
+				extractStats["canonical_qa_success"], extractStats["canonical_qa_failed"]))
+		}
+		if extractStats["question_keys_success"] > 0 || extractStats["question_keys_failed"] > 0 {
+			content.WriteString(fmt.Sprintf("  Question Keys: %d / %d\n",
+				extractStats["question_keys_success"], extractStats["question_keys_failed"]))
+		}
+
+		lastError := m.client.GetLastError()
+		if lastError != "" {
+			content.WriteString("\n" + helpStyle.Render("Last Error:") + "\n")
+			errorStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+			content.WriteString(errorStyle.Render(lastError) + "\n")
+		}
+		content.WriteString("\n")
+	}
 
 	if m.lastVectorDebug != "" {
 		content.WriteString(helpStyle.Render("Last Query Debug:") + "\n")

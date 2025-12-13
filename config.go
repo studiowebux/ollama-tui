@@ -7,16 +7,19 @@ import (
 )
 
 type Config struct {
-	Endpoint              string `json:"endpoint"`
-	Model                 string `json:"model"`
-	SummaryPrompt         string `json:"summary_prompt"`
-	VectorEnabled         bool   `json:"vector_enabled"`
-	VectorModel           string `json:"vector_model"`
-	VectorTopK            int    `json:"vector_top_k"`
+	Endpoint              string  `json:"endpoint"`
+	Model                 string  `json:"model"`
+	SummaryPrompt         string  `json:"summary_prompt"`
+	CurrentProject        string  `json:"current_project"`
+	VectorEnabled         bool    `json:"vector_enabled"`
+	VectorModel           string  `json:"vector_model"`
+	VectorTopK            int     `json:"vector_top_k"`
 	VectorSimilarity      float64 `json:"vector_similarity_threshold"`
-	VectorDebug           bool   `json:"vector_debug"`
-	VectorExtractMetadata bool   `json:"vector_extract_metadata"`
-	VectorIncludeRelated  bool   `json:"vector_include_related"`
+	VectorDebug           bool    `json:"vector_debug"`
+	VectorExtractMetadata bool    `json:"vector_extract_metadata"`      // Extract metadata during vectorization
+	VectorEnhanceQuery    bool    `json:"vector_enhance_query"`         // Enhance queries at message-send time (slow)
+	VectorIncludeRelated  bool    `json:"vector_include_related"`
+	VectorLightMode       bool    `json:"vector_light_mode"` // Skip heavy extractions for slow systems
 }
 
 func configPath() (string, error) {
@@ -41,13 +44,16 @@ func LoadConfig() (*Config, error) {
 		Endpoint: "http://localhost:11434",
 		Model:    "llama2",
 		SummaryPrompt: "Summarize this conversation:\n- Who: names, roles, entities mentioned\n- Context: topic, purpose, domain\n- Key points: facts, opinions, decisions, technical details (code snippets, commands, file paths, URLs, numbers, versions)\n- Fictional/hypothetical: examples, scenarios, placeholders, world-building elements, rules\n- Unresolved: open questions, disagreements, errors\n- Next steps (if any)\n\nConcise. Preserve tone and intent. Maintain factual accuracy.\n\nCONVERSATION TO SUMMARIZE:\n\n",
+		CurrentProject:        "default",
 		VectorEnabled:         true,
 		VectorModel:           "nomic-embed-text",
 		VectorTopK:            3,
 		VectorSimilarity:      0.7,
 		VectorDebug:           false,
 		VectorExtractMetadata: true,
+		VectorEnhanceQuery:    false, // Disabled by default for speed
 		VectorIncludeRelated:  false,
+		VectorLightMode:       false,
 	}
 
 	data, err := os.ReadFile(path)

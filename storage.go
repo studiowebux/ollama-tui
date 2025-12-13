@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -26,17 +27,19 @@ type Chat struct {
 }
 
 type Storage struct {
-	dataDir string
+	dataDir        string
+	projectManager *ProjectManager
+	currentProject string
 }
 
-func NewStorage() (*Storage, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
+func NewStorage(pm *ProjectManager, projectID string) (*Storage, error) {
+	dataDir := pm.GetChatsPath(projectID)
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, err
 	}
 
-	dataDir := filepath.Join(home, ".ollama-ui", "chats")
-	if err := os.MkdirAll(dataDir, 0755); err != nil {
+	home, err := os.UserHomeDir()
+	if err != nil {
 		return nil, err
 	}
 
@@ -45,7 +48,21 @@ func NewStorage() (*Storage, error) {
 		return nil, err
 	}
 
-	return &Storage{dataDir: dataDir}, nil
+	return &Storage{
+		dataDir:        dataDir,
+		projectManager: pm,
+		currentProject: projectID,
+	}, nil
+}
+
+func (s *Storage) SwitchProject(projectID string) error {
+	dataDir := s.projectManager.GetChatsPath(projectID)
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return err
+	}
+	s.dataDir = dataDir
+	s.currentProject = projectID
+	return nil
 }
 
 func (s *Storage) CreateChat(model string) (*Chat, error) {
@@ -136,10 +153,15 @@ func (s *Storage) AddMessage(chat *Chat, role, content string) error {
 	chat.Messages = append(chat.Messages, msg)
 
 	if len(chat.Messages) <= 2 && chat.Title == "New Chat" {
-		if len(content) > 50 {
-			chat.Title = content[:50] + "..."
+		// Strip newlines and normalize whitespace for title
+		titleContent := strings.ReplaceAll(content, "\n", " ")
+		titleContent = strings.ReplaceAll(titleContent, "\r", " ")
+		titleContent = strings.Join(strings.Fields(titleContent), " ") // Collapse multiple spaces
+
+		if len(titleContent) > 50 {
+			chat.Title = titleContent[:50] + "..."
 		} else {
-			chat.Title = content
+			chat.Title = titleContent
 		}
 	}
 

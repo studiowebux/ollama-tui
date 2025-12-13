@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"math"
 	"os"
@@ -32,18 +34,32 @@ const (
 	StrategyWhoWhatWhy   ChunkStrategy = "who_what_why"   // Structured Q&A
 	StrategyKeyword      ChunkStrategy = "keyword"        // Keyword-based
 	StrategyEntitySheet  ChunkStrategy = "entity_sheet"   // Character/location sheet
+	StrategyQuestionKey  ChunkStrategy = "question_key"   // Generated question as key, content as answer
 )
+
+// StoredContent represents deduplicated content
+type StoredContent struct {
+	Hash      string    `json:"hash"`
+	Content   string    `json:"content"`
+	RefCount  int       `json:"ref_count"`
+	CreatedAt time.Time `json:"created_at"`
+}
 
 // VectorChunk represents a single embedded chunk of conversation
 type VectorChunk struct {
 	ID          string        `json:"id"`
 	ChatID      string        `json:"chat_id"`
-	Content     string        `json:"content"`
+	ContentHash string        `json:"content_hash"` // Reference to StoredContent
+	Content     string        `json:"content"`      // Kept for backward compatibility
 	ContentType ContentType   `json:"content_type"`
 	Strategy    ChunkStrategy `json:"strategy"`
 	Embedding   []float64     `json:"embedding"`
 	Metadata    ChunkMetadata `json:"metadata"`
 	CreatedAt   time.Time     `json:"created_at"`
+
+	// Canonical Q&A pairs for better matching
+	CanonicalQuestions []string `json:"canonical_questions"`
+	CanonicalAnswer    string   `json:"canonical_answer"`
 }
 
 // ChunkMetadata stores additional context about the chunk
@@ -89,10 +105,19 @@ type ChunkMetadata struct {
 	OriginalText  string `json:"original_text"`  // Full original message
 }
 
+// ContentStore manages deduplicated content
+type ContentStore struct {
+	contents map[string]*StoredContent
+	dataDir  string
+}
+
 // VectorDB manages the vector database
 type VectorDB struct {
-	dataDir string
-	chunks  []VectorChunk
+	dataDir        string
+	chunks         []VectorChunk
+	projectManager *ProjectManager
+	currentProject string
+	contentStore   *ContentStore
 }
 
 // SearchResult represents a similarity search result
@@ -101,20 +126,125 @@ type SearchResult struct {
 	Similarity float64
 }
 
-func NewVectorDB() (*VectorDB, error) {
-	home, err := os.UserHomeDir()
-	if err != nil {
+func NewContentStore(dataDir string) (*ContentStore, error) {
+	storeDir := filepath.Join(dataDir, "content")
+	if err := os.MkdirAll(storeDir, 0755); err != nil {
 		return nil, err
 	}
 
-	dataDir := filepath.Join(home, ".ollama-ui", "vectors")
+	cs := &ContentStore{
+		contents: make(map[string]*StoredContent),
+		dataDir:  storeDir,
+	}
+
+	if err := cs.loadAll(); err != nil {
+		return nil, err
+	}
+
+	return cs, nil
+}
+
+func (cs *ContentStore) hashContent(content string) string {
+	hash := sha256.Sum256([]byte(content))
+	return hex.EncodeToString(hash[:])
+}
+
+func (cs *ContentStore) Store(content string) (string, error) {
+	hash := cs.hashContent(content)
+
+	if existing, ok := cs.contents[hash]; ok {
+		existing.RefCount++
+		return hash, cs.save(existing)
+	}
+
+	stored := &StoredContent{
+		Hash:      hash,
+		Content:   content,
+		RefCount:  1,
+		CreatedAt: time.Now(),
+	}
+
+	cs.contents[hash] = stored
+	return hash, cs.save(stored)
+}
+
+func (cs *ContentStore) Get(hash string) (string, bool) {
+	if content, ok := cs.contents[hash]; ok {
+		return content.Content, true
+	}
+	return "", false
+}
+
+func (cs *ContentStore) DecrementRef(hash string) error {
+	if content, ok := cs.contents[hash]; ok {
+		content.RefCount--
+		if content.RefCount <= 0 {
+			delete(cs.contents, hash)
+			path := filepath.Join(cs.dataDir, hash+".json")
+			return os.Remove(path)
+		}
+		return cs.save(content)
+	}
+	return nil
+}
+
+func (cs *ContentStore) save(content *StoredContent) error {
+	data, err := json.MarshalIndent(content, "", "  ")
+	if err != nil {
+		return err
+	}
+	path := filepath.Join(cs.dataDir, content.Hash+".json")
+	return os.WriteFile(path, data, 0644)
+}
+
+func (cs *ContentStore) loadAll() error {
+	files, err := os.ReadDir(cs.dataDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+
+	for _, file := range files {
+		if filepath.Ext(file.Name()) != ".json" {
+			continue
+		}
+
+		path := filepath.Join(cs.dataDir, file.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+
+		var content StoredContent
+		if err := json.Unmarshal(data, &content); err != nil {
+			continue
+		}
+
+		cs.contents[content.Hash] = &content
+	}
+
+	return nil
+}
+
+func NewVectorDB(pm *ProjectManager, projectID string) (*VectorDB, error) {
+	dataDir := pm.GetVectorsPath(projectID)
 	if err := os.MkdirAll(dataDir, 0755); err != nil {
 		return nil, err
 	}
 
+	contentStore, err := NewContentStore(dataDir)
+	if err != nil {
+		return nil, err
+	}
+
 	db := &VectorDB{
-		dataDir: dataDir,
-		chunks:  []VectorChunk{},
+		dataDir:        dataDir,
+		chunks:         []VectorChunk{},
+		projectManager: pm,
+		currentProject: projectID,
+		contentStore:   contentStore,
 	}
 
 	if err := db.loadAllChunks(); err != nil {
@@ -124,14 +254,53 @@ func NewVectorDB() (*VectorDB, error) {
 	return db, nil
 }
 
-// AddChunk stores a new vector chunk
+func (db *VectorDB) SwitchProject(projectID string) error {
+	dataDir := db.projectManager.GetVectorsPath(projectID)
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return err
+	}
+
+	contentStore, err := NewContentStore(dataDir)
+	if err != nil {
+		return err
+	}
+
+	db.dataDir = dataDir
+	db.currentProject = projectID
+	db.contentStore = contentStore
+	db.chunks = []VectorChunk{}
+	return db.loadAllChunks()
+}
+
+// AddChunk stores a new vector chunk with content deduplication
 func (db *VectorDB) AddChunk(chunk VectorChunk) error {
 	chunk.ID = uuid.New().String()
 	chunk.CreatedAt = time.Now()
 
+	// Store content in content store and get hash
+	if chunk.Content != "" {
+		hash, err := db.contentStore.Store(chunk.Content)
+		if err != nil {
+			return err
+		}
+		chunk.ContentHash = hash
+	}
+
 	db.chunks = append(db.chunks, chunk)
 
 	return db.saveChunk(chunk)
+}
+
+// GetChunkContent retrieves the actual content for a chunk
+func (db *VectorDB) GetChunkContent(chunk *VectorChunk) string {
+	// Try to get from content store first
+	if chunk.ContentHash != "" {
+		if content, ok := db.contentStore.Get(chunk.ContentHash); ok {
+			return content
+		}
+	}
+	// Fallback to embedded content for backward compatibility
+	return chunk.Content
 }
 
 // Search finds the most similar chunks to the query embedding
@@ -170,7 +339,11 @@ func (db *VectorDB) DeleteChatChunks(chatID string) error {
 		if chunk.ChatID != chatID {
 			filtered = append(filtered, chunk)
 		} else {
-			// Delete the file
+			// Decrement content reference count
+			if chunk.ContentHash != "" {
+				db.contentStore.DecrementRef(chunk.ContentHash)
+			}
+			// Delete the chunk file
 			path := filepath.Join(db.dataDir, chunk.ID+".json")
 			os.Remove(path)
 		}
@@ -238,6 +411,10 @@ func (db *VectorDB) DeleteChunk(chunkID string) error {
 		if chunk.ID != chunkID {
 			filtered = append(filtered, chunk)
 		} else {
+			// Decrement content reference count
+			if chunk.ContentHash != "" {
+				db.contentStore.DecrementRef(chunk.ContentHash)
+			}
 			path := filepath.Join(db.dataDir, chunk.ID+".json")
 			os.Remove(path)
 		}
@@ -264,11 +441,12 @@ func (db *VectorDB) GetStats() map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"total_chunks":  totalChunks,
-		"marked_bad":    markedBad,
-		"verified":      verified,
-		"unique_chats":  len(chatIDs),
-		"storage_path":  db.dataDir,
+		"total_chunks":    totalChunks,
+		"marked_bad":      markedBad,
+		"verified":        verified,
+		"unique_chats":    len(chatIDs),
+		"storage_path":    db.dataDir,
+		"stored_contents": len(db.contentStore.contents),
 	}
 }
 
@@ -292,6 +470,18 @@ func (db *VectorDB) ClearAll() error {
 			}
 		}
 	}
+
+	// Clear content store
+	contentFiles, err := os.ReadDir(db.contentStore.dataDir)
+	if err == nil {
+		for _, file := range contentFiles {
+			if filepath.Ext(file.Name()) == ".json" {
+				path := filepath.Join(db.contentStore.dataDir, file.Name())
+				os.Remove(path)
+			}
+		}
+	}
+	db.contentStore.contents = make(map[string]*StoredContent)
 
 	db.chunks = []VectorChunk{}
 	return nil
@@ -483,9 +673,26 @@ func (db *VectorDB) SearchHybrid(queryEmbedding []float64, queryText string, top
 			}
 		}
 
-		// Cap keyword boost at 0.35 to prevent overwhelming semantic score
-		if keywordBoost > 0.35 {
-			keywordBoost = 0.35
+		// Check canonical questions (VERY strong boost for exact matches)
+		if len(chunk.CanonicalQuestions) > 0 {
+			for _, canonQ := range chunk.CanonicalQuestions {
+				canonLower := strings.ToLower(canonQ)
+				// Exact match or high similarity
+				if strings.Contains(canonLower, queryLower) || strings.Contains(queryLower, canonLower) {
+					keywordBoost += 0.30
+				}
+				// Word-by-word matching
+				for _, queryWord := range queryWords {
+					if strings.Contains(canonLower, queryWord) {
+						keywordBoost += 0.05
+					}
+				}
+			}
+		}
+
+		// Cap keyword boost at 0.45 to prevent overwhelming semantic score
+		if keywordBoost > 0.45 {
+			keywordBoost = 0.45
 		}
 
 		// Combine scores: 70% semantic + 30% keyword (when keyword matches exist)
