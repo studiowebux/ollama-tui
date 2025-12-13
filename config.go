@@ -7,8 +7,9 @@ import (
 )
 
 type Config struct {
-	Endpoint string `json:"endpoint"`
-	Model    string `json:"model"`
+	Endpoint      string `json:"endpoint"`
+	Model         string `json:"model"`
+	SummaryPrompt string `json:"summary_prompt"`
 }
 
 func configPath() (string, error) {
@@ -32,6 +33,25 @@ func LoadConfig() (*Config, error) {
 	config := &Config{
 		Endpoint: "http://localhost:11434",
 		Model:    "llama2",
+		SummaryPrompt: `You are tasked with summarizing a conversation to preserve essential information while reducing context size.
+
+REQUIREMENTS:
+1. Extract and preserve all key decisions, conclusions, and action items
+2. Maintain technical details: code snippets, commands, configurations, file paths, URLs
+3. Preserve specific numbers, versions, parameters, and measurements
+4. Keep error messages, warnings, and their solutions
+5. Document the logical flow and reasoning behind decisions
+6. Include relevant context needed to continue the conversation seamlessly
+
+FORMAT:
+- Use clear, structured markdown with headers
+- Group related information together
+- Be concise but complete - don't omit critical details
+- Focus on facts and outcomes, not conversational filler
+
+CONVERSATION TO SUMMARIZE:
+
+`,
 	}
 
 	data, err := os.ReadFile(path)

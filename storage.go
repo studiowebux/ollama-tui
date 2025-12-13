@@ -40,6 +40,11 @@ func NewStorage() (*Storage, error) {
 		return nil, err
 	}
 
+	backupDir := filepath.Join(home, ".ollama-ui", "backups")
+	if err := os.MkdirAll(backupDir, 0755); err != nil {
+		return nil, err
+	}
+
 	return &Storage{dataDir: dataDir}, nil
 }
 
@@ -139,4 +144,23 @@ func (s *Storage) AddMessage(chat *Chat, role, content string) error {
 	}
 
 	return s.SaveChat(chat)
+}
+
+func (s *Storage) BackupChat(chat *Chat) error {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+
+	backupDir := filepath.Join(home, ".ollama-ui", "backups")
+	timestamp := time.Now().Format("20060102_150405")
+	filename := chat.ID + "_" + timestamp + ".json"
+	path := filepath.Join(backupDir, filename)
+
+	data, err := json.MarshalIndent(chat, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(path, data, 0644)
 }
