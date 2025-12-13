@@ -164,3 +164,22 @@ func (s *Storage) BackupChat(chat *Chat) error {
 
 	return os.WriteFile(path, data, 0644)
 }
+
+// ClearAllChats deletes all chat files
+func (s *Storage) ClearAllChats() error {
+	files, err := os.ReadDir(s.dataDir)
+	if err != nil {
+		return err
+	}
+
+	for _, file := range files {
+		if filepath.Ext(file.Name()) == ".json" {
+			path := filepath.Join(s.dataDir, file.Name())
+			if err := os.Remove(path); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}

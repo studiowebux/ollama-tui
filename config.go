@@ -7,9 +7,16 @@ import (
 )
 
 type Config struct {
-	Endpoint      string `json:"endpoint"`
-	Model         string `json:"model"`
-	SummaryPrompt string `json:"summary_prompt"`
+	Endpoint              string `json:"endpoint"`
+	Model                 string `json:"model"`
+	SummaryPrompt         string `json:"summary_prompt"`
+	VectorEnabled         bool   `json:"vector_enabled"`
+	VectorModel           string `json:"vector_model"`
+	VectorTopK            int    `json:"vector_top_k"`
+	VectorSimilarity      float64 `json:"vector_similarity_threshold"`
+	VectorDebug           bool   `json:"vector_debug"`
+	VectorExtractMetadata bool   `json:"vector_extract_metadata"`
+	VectorIncludeRelated  bool   `json:"vector_include_related"`
 }
 
 func configPath() (string, error) {
@@ -33,25 +40,14 @@ func LoadConfig() (*Config, error) {
 	config := &Config{
 		Endpoint: "http://localhost:11434",
 		Model:    "llama2",
-		SummaryPrompt: `You are tasked with summarizing a conversation to preserve essential information while reducing context size.
-
-REQUIREMENTS:
-1. Extract and preserve all key decisions, conclusions, and action items
-2. Maintain technical details: code snippets, commands, configurations, file paths, URLs
-3. Preserve specific numbers, versions, parameters, and measurements
-4. Keep error messages, warnings, and their solutions
-5. Document the logical flow and reasoning behind decisions
-6. Include relevant context needed to continue the conversation seamlessly
-
-FORMAT:
-- Use clear, structured markdown with headers
-- Group related information together
-- Be concise but complete - don't omit critical details
-- Focus on facts and outcomes, not conversational filler
-
-CONVERSATION TO SUMMARIZE:
-
-`,
+		SummaryPrompt: "Summarize this conversation:\n- Who: names, roles, entities mentioned\n- Context: topic, purpose, domain\n- Key points: facts, opinions, decisions, technical details (code snippets, commands, file paths, URLs, numbers, versions)\n- Fictional/hypothetical: examples, scenarios, placeholders, world-building elements, rules\n- Unresolved: open questions, disagreements, errors\n- Next steps (if any)\n\nConcise. Preserve tone and intent. Maintain factual accuracy.\n\nCONVERSATION TO SUMMARIZE:\n\n",
+		VectorEnabled:         true,
+		VectorModel:           "nomic-embed-text",
+		VectorTopK:            3,
+		VectorSimilarity:      0.7,
+		VectorDebug:           false,
+		VectorExtractMetadata: true,
+		VectorIncludeRelated:  false,
 	}
 
 	data, err := os.ReadFile(path)

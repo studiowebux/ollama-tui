@@ -20,10 +20,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	vectorDB, err := NewVectorDB()
+	if err != nil {
+		fmt.Printf("Error initializing vector DB: %v\n", err)
+		os.Exit(1)
+	}
+
 	client := NewOllamaClient(config.Endpoint)
 
 	p := tea.NewProgram(
-		initialModel(storage, client, config),
+		initialModel(storage, client, config, vectorDB),
 		tea.WithAltScreen(),
 	)
 

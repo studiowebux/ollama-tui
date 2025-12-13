@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/charmbracelet/bubbles/textarea"
@@ -16,37 +17,45 @@ const (
 	chatView view = iota
 	chatListView
 	settingsView
+	vectorStatsView
+	confirmResetView
 )
 
 type model struct {
-	storage         *Storage
-	client          *OllamaClient
-	config          *Config
-	currentView     view
-	currentChat     *Chat
-	chats           []*Chat
-	textarea        textarea.Model
-	viewport        viewport.Model
-	messages        []string
-	messageRoles    []string
-	streaming       bool
-	summarizing     bool
-	err             error
-	width           int
-	height          int
-	chatListCursor  int
-	settingsInput   string
-	settingsFocus   int
-	models          []string
-	modelCursor     int
-	chunkChan       chan string
-	errChan         chan error
-	endpointInput   textarea.Model
-	editingEndpoint bool
-	summaryInput    textarea.Model
-	editingSummary  bool
-	contextSize     int
-	lastKeyG        bool
+	storage           *Storage
+	client            *OllamaClient
+	config            *Config
+	vectorDB          *VectorDB
+	currentView       view
+	currentChat       *Chat
+	chats             []*Chat
+	textarea          textarea.Model
+	viewport          viewport.Model
+	messages          []string
+	messageRoles      []string
+	streaming         bool
+	summarizing       bool
+	vectorizing       bool
+	vectorProgress    string
+	err               error
+	width             int
+	height            int
+	chatListCursor    int
+	settingsInput     string
+	settingsFocus     int
+	models            []string
+	modelCursor       int
+	chunkChan         chan string
+	errChan           chan error
+	endpointInput     textarea.Model
+	editingEndpoint   bool
+	summaryInput      textarea.Model
+	editingSummary    bool
+	contextSize       int
+	lastKeyG          bool
+	lastVectorResults []SearchResult
+	vectorContextUsed bool
+	lastVectorDebug   string
 }
 
 type streamChunkMsg string
@@ -57,6 +66,7 @@ type streamStartMsg struct {
 }
 type errMsg struct{ err error }
 type contextSizeMsg int
+type resetCompleteMsg struct{}
 
 var (
 	titleStyle = lipgloss.NewStyle().
@@ -82,7 +92,7 @@ var (
 			Foreground(lipgloss.Color("243"))
 )
 
-func initialModel(storage *Storage, client *OllamaClient, config *Config) model {
+func initialModel(storage *Storage, client *OllamaClient, config *Config, vectorDB *VectorDB) model {
 	ta := textarea.New()
 	ta.Placeholder = "Type your message..."
 	ta.Focus()
@@ -111,6 +121,7 @@ func initialModel(storage *Storage, client *OllamaClient, config *Config) model 
 		storage:       storage,
 		client:        client,
 		config:        config,
+		vectorDB:      vectorDB,
 		currentView:   chatListView,
 		textarea:      ta,
 		viewport:      vp,
@@ -144,6 +155,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleChatListViewKeys(msg)
 		case settingsView:
 			return m.handleSettingsViewKeys(msg)
+		case vectorStatsView:
+			return m.handleVectorStatsViewKeys(msg)
+		case confirmResetView:
+			return m.handleConfirmResetViewKeys(msg)
 		}
 
 	case streamStartMsg:
@@ -194,6 +209,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		return m, nil
 
+	case vectorizeProgressMsg:
+		m.vectorProgress = fmt.Sprintf("%d/%d", msg.current, msg.total)
+		return m, nil
+
+	case vectorizeMsg:
+		m.vectorizing = false
+		m.vectorProgress = ""
+		return m, nil
+
 	case summarizeMsg:
 		m.summarizing = false
 		if m.currentChat != nil {
@@ -213,6 +237,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case contextSizeMsg:
 		m.contextSize = int(msg)
 		return m, nil
+
+	case resetCompleteMsg:
+		m.chats = []*Chat{}
+		m.currentChat = nil
+		m.messages = []string{}
+		m.messageRoles = []string{}
+		m.lastVectorResults = nil
+		m.lastVectorDebug = ""
+		m.vectorContextUsed = false
+		m.currentView = chatListView
+		return m, m.loadChats
 	}
 
 	m.viewport, cmd = m.viewport.Update(msg)
@@ -229,6 +264,10 @@ func (m model) View() string {
 		return m.renderChatListView()
 	case settingsView:
 		return m.renderSettingsView()
+	case vectorStatsView:
+		return m.renderVectorStatsView()
+	case confirmResetView:
+		return m.renderConfirmResetView()
 	}
 	return ""
 }
@@ -252,13 +291,23 @@ func (m model) renderChatView() string {
 		}
 	}
 
-	help := helpStyle.Render("esc: back | ctrl+j/k or pgup/pgdn: scroll | ctrl+n: new | ctrl+s: settings | ctrl+t: summarize")
+	help := helpStyle.Render("esc: back | ctrl+j/k or pgup/pgdn: scroll | ctrl+n: new | ctrl+s: settings | ctrl+t: summarize | ctrl+b: vectorize | ctrl+v: vector info")
 
 	status := ""
-	if m.summarizing {
-		status = helpStyle.Render("Summarizing conversation...")
+	if m.vectorContextUsed {
+		vectorIndicator := lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Render("Vector context used")
+		status = vectorIndicator + " "
+	}
+	if m.vectorizing {
+		if m.vectorProgress != "" {
+			status += helpStyle.Render(fmt.Sprintf("Vectorizing conversation... %s", m.vectorProgress))
+		} else {
+			status += helpStyle.Render("Vectorizing conversation...")
+		}
+	} else if m.summarizing {
+		status += helpStyle.Render("Summarizing conversation...")
 	} else if m.streaming {
-		status = helpStyle.Render("Streaming...")
+		status += helpStyle.Render("Streaming...")
 	}
 	if m.err != nil {
 		status = errorStyle.Render(fmt.Sprintf("Error: %v", m.err))
@@ -279,7 +328,7 @@ func (m model) renderChatView() string {
 func (m model) renderChatListView() string {
 	title := titleStyle.Render("Chat History")
 	modelInfo := helpStyle.Render(fmt.Sprintf("Current model: %s", m.config.Model))
-	help := helpStyle.Render("↑/↓: navigate | enter: open | n: new chat | d: delete | s: settings | q: quit")
+	help := helpStyle.Render("↑/↓: navigate | enter: open | n: new chat | d: delete | s: settings | v: vector stats | r: reset all | q: quit")
 
 	var content strings.Builder
 	content.WriteString(title + " - " + modelInfo + "\n\n")
@@ -381,6 +430,28 @@ func (m model) renderSettingsView() string {
 		content.WriteString(summaryValue + "\n")
 	}
 
+	content.WriteString("\n")
+
+	// Vector Settings
+	vectorLabel := "Vector DB:"
+	if m.settingsFocus == 3 {
+		vectorLabel = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Render("> " + vectorLabel)
+	} else {
+		vectorLabel = "  " + vectorLabel
+	}
+	content.WriteString(vectorLabel + "\n")
+
+	vectorStatus := "Disabled"
+	if m.config.VectorEnabled {
+		vectorStatus = fmt.Sprintf("Enabled (model: %s, topK: %d, threshold: %.2f)",
+			m.config.VectorModel, m.config.VectorTopK, m.config.VectorSimilarity)
+	}
+	vectorValue := "  " + vectorStatus
+	if m.settingsFocus == 3 {
+		vectorValue = lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Render(vectorValue)
+	}
+	content.WriteString(vectorValue + "\n")
+
 	content.WriteString("\n" + help)
 	return content.String()
 }
@@ -407,6 +478,13 @@ func (m *model) handleChatViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	if msg.Type == tea.KeyCtrlT {
 		return m, m.summarizeChat()
+	}
+	if msg.Type == tea.KeyCtrlB {
+		return m, m.vectorizeChat()
+	}
+	if msg.Type == tea.KeyCtrlV {
+		m.currentView = vectorStatsView
+		return m, nil
 	}
 
 	// Handle scrolling with Ctrl+j/k and PgUp/PgDn
@@ -483,6 +561,14 @@ func (m *model) handleChatListViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "s":
 		m.currentView = settingsView
 		return m, m.loadModels
+
+	case "v":
+		m.currentView = vectorStatsView
+		return m, nil
+
+	case "r":
+		m.currentView = confirmResetView
+		return m, nil
 	}
 
 	return m, nil
@@ -548,7 +634,7 @@ func (m *model) handleSettingsViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "tab":
 		m.editingEndpoint = false
 		m.editingSummary = false
-		m.settingsFocus = (m.settingsFocus + 1) % 3
+		m.settingsFocus = (m.settingsFocus + 1) % 4
 
 	case "up", "k":
 		if m.settingsFocus == 1 && len(m.models) > 0 {
@@ -581,6 +667,10 @@ func (m *model) handleSettingsViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.editingSummary = true
 			m.summaryInput.Focus()
 			return m, textarea.Blink
+		} else if m.settingsFocus == 3 {
+			// Toggle vector DB
+			m.config.VectorEnabled = !m.config.VectorEnabled
+			m.config.Save()
 		}
 	}
 
@@ -636,12 +726,26 @@ func (m *model) sendMessage() tea.Cmd {
 	m.streaming = true
 	m.updateViewport()
 
+	// Retrieve relevant context from vector DB
+	relevantContext, err := m.retrieveRelevantContext(userMsg)
+	if err != nil {
+		return func() tea.Msg {
+			return errMsg{err: fmt.Errorf("context retrieval failed: %w", err)}
+		}
+	}
+
 	chatMessages := make([]ChatMessage, 0, len(m.currentChat.Messages))
 	for _, msg := range m.currentChat.Messages {
 		chatMessages = append(chatMessages, ChatMessage{
 			Role:    msg.Role,
 			Content: msg.Content,
 		})
+	}
+
+	// Prepend context to the last user message if found
+	if relevantContext != "" {
+		lastIdx := len(chatMessages) - 1
+		chatMessages[lastIdx].Content = relevantContext + "\n---\n\n" + chatMessages[lastIdx].Content
 	}
 
 	return m.streamResponse(chatMessages)
@@ -721,6 +825,40 @@ type summarizeMsg struct {
 	summary string
 }
 
+type vectorizeMsg struct{}
+type vectorizeProgressMsg struct {
+	current int
+	total   int
+}
+
+func (m *model) vectorizeChat() tea.Cmd {
+	if m.currentChat == nil || len(m.currentChat.Messages) == 0 {
+		return func() tea.Msg {
+			return errMsg{err: fmt.Errorf("no chat to vectorize")}
+		}
+	}
+
+	m.vectorizing = true
+
+	return func() tea.Msg {
+		cleanedMessages := make([]Message, len(m.currentChat.Messages))
+		for i, msg := range m.currentChat.Messages {
+			cleanedMessages[i] = Message{
+				Role:      msg.Role,
+				Content:   stripThinkingTags(msg.Content),
+				Timestamp: msg.Timestamp,
+			}
+		}
+
+		// Vectorize conversation
+		if err := m.vectorizeConversation(cleanedMessages, nil); err != nil {
+			return errMsg{err: fmt.Errorf("vectorization failed: %w", err)}
+		}
+
+		return vectorizeMsg{}
+	}
+}
+
 func (m *model) summarizeChat() tea.Cmd {
 	if m.currentChat == nil || len(m.currentChat.Messages) == 0 {
 		return func() tea.Msg {
@@ -741,6 +879,13 @@ func (m *model) summarizeChat() tea.Cmd {
 				Role:      msg.Role,
 				Content:   stripThinkingTags(msg.Content),
 				Timestamp: msg.Timestamp,
+			}
+		}
+
+		// Vectorize conversation if enabled
+		if m.config.VectorEnabled {
+			if err := m.vectorizeConversation(cleanedMessages, nil); err != nil {
+				return errMsg{err: fmt.Errorf("vectorization failed: %w", err)}
 			}
 		}
 
@@ -868,4 +1013,467 @@ func (m model) fetchContextSize() tea.Msg {
 		return contextSizeMsg(4096)
 	}
 	return contextSizeMsg(contextSize)
+}
+
+// vectorizeConversation creates embeddings for message pairs using multiple strategies
+func (m *model) vectorizeConversation(messages []Message, progressChan chan<- tea.Msg) error {
+	var prevChunkID string
+
+	// Count Q&A pairs
+	totalPairs := 0
+	for i := 0; i < len(messages)-1; i += 2 {
+		if i+1 >= len(messages) {
+			break
+		}
+		if messages[i].Role == "user" && messages[i+1].Role == "assistant" {
+			totalPairs++
+		}
+	}
+
+	currentPair := 0
+	for i := 0; i < len(messages)-1; i += 2 {
+		if i+1 >= len(messages) {
+			break
+		}
+
+		userMsg := messages[i]
+		assistantMsg := messages[i+1]
+
+		if userMsg.Role != "user" || assistantMsg.Role != "assistant" {
+			continue
+		}
+
+		currentPair++
+		if progressChan != nil {
+			progressChan <- vectorizeProgressMsg{current: currentPair, total: totalPairs}
+		}
+
+		content := fmt.Sprintf("Q: %s\nA: %s", userMsg.Content, assistantMsg.Content)
+		mainChunkID := ""
+
+		// Detect content type first
+		contentType := ContentType("dialog")
+		if m.config.VectorExtractMetadata {
+			detectedType, _ := m.client.DetectContentType(m.config.Model, userMsg.Content, assistantMsg.Content)
+			if detectedType != "" {
+				contentType = ContentType(detectedType)
+			}
+		}
+
+		// STRATEGY 1: Create main full Q&A chunk
+		embedding, err := m.client.GenerateEmbedding(m.config.VectorModel, content)
+		if err != nil {
+			return err
+		}
+
+		baseMetadata := ChunkMetadata{
+			UserMessage:      userMsg.Content,
+			AssistantMessage: assistantMsg.Content,
+			Timestamp:        userMsg.Timestamp,
+			ParentChunkID:    prevChunkID,
+			OriginalText:     assistantMsg.Content,
+		}
+
+		mainChunk := VectorChunk{
+			ChatID:      m.currentChat.ID,
+			Content:     content,
+			ContentType: contentType,
+			Strategy:    StrategyFullQA,
+			Embedding:   embedding,
+			Metadata:    baseMetadata,
+		}
+
+		if err := m.vectorDB.AddChunk(mainChunk); err != nil {
+			return err
+		}
+
+		mainChunkID = mainChunk.ID
+		prevChunkID = mainChunk.ID
+		relatedIDs := []string{}
+
+		// ALWAYS apply sentence-level chunking (doesn't require LLM extraction)
+		// STRATEGY 2: Sentence-level chunking for long responses
+		sentences := strings.Split(assistantMsg.Content, ". ")
+		if len(sentences) > 1 {
+			for idx, sentence := range sentences {
+				sentence = strings.TrimSpace(sentence)
+				if len(sentence) < 20 {
+					continue
+				}
+				if !strings.HasSuffix(sentence, ".") && idx < len(sentences)-1 {
+					sentence += "."
+				}
+
+				sentContent := fmt.Sprintf("Q: %s\nA: %s", userMsg.Content, sentence)
+				if sentEmbed, err := m.client.GenerateEmbedding(m.config.VectorModel, sentContent); err == nil {
+					sentChunk := VectorChunk{
+						ChatID:      m.currentChat.ID,
+						Content:     sentContent,
+						ContentType: contentType,
+						Strategy:    StrategySentence,
+						Embedding:   sentEmbed,
+						Metadata: ChunkMetadata{
+							UserMessage:      userMsg.Content,
+							AssistantMessage: sentence,
+							Timestamp:        userMsg.Timestamp,
+							ParentChunkID:    mainChunkID,
+							SentenceIndex:    idx,
+							OriginalText:     assistantMsg.Content,
+						},
+					}
+					if err := m.vectorDB.AddChunk(sentChunk); err == nil {
+						relatedIDs = append(relatedIDs, sentChunk.ID)
+					}
+				}
+			}
+		}
+
+		// Apply advanced extraction strategies if enabled
+		if m.config.VectorExtractMetadata {
+			// STRATEGY 3: Extract structured who/what/why/when/where/how
+			if structuredQA, err := m.client.ExtractStructuredQA(m.config.Model, userMsg.Content, assistantMsg.Content); err == nil && structuredQA != nil {
+				qaContent := fmt.Sprintf("Who: %s\nWhat: %s\nWhy: %s\nWhen: %s\nWhere: %s\nHow: %s",
+					structuredQA.Who, structuredQA.What, structuredQA.Why, structuredQA.When, structuredQA.Where, structuredQA.How)
+
+				if qaEmbed, err := m.client.GenerateEmbedding(m.config.VectorModel, qaContent); err == nil {
+					qaChunk := VectorChunk{
+						ChatID:      m.currentChat.ID,
+						Content:     qaContent,
+						ContentType: contentType,
+						Strategy:    StrategyWhoWhatWhy,
+						Embedding:   qaEmbed,
+						Metadata: ChunkMetadata{
+							UserMessage:      userMsg.Content,
+							AssistantMessage: assistantMsg.Content,
+							Timestamp:        userMsg.Timestamp,
+							ParentChunkID:    mainChunkID,
+							Who:              structuredQA.Who,
+							What:             structuredQA.What,
+							Why:              structuredQA.Why,
+							When:             structuredQA.When,
+							Where:            structuredQA.Where,
+							How:              structuredQA.How,
+							SearchKeywords:   structuredQA.Keywords,
+						},
+					}
+					if err := m.vectorDB.AddChunk(qaChunk); err == nil {
+						relatedIDs = append(relatedIDs, qaChunk.ID)
+					}
+				}
+			}
+
+			// STRATEGY 3: Extract key-value pairs (entity registry)
+			if kvPairs, err := m.client.ExtractKeyValuePairs(m.config.Model, userMsg.Content, assistantMsg.Content); err == nil && len(kvPairs) > 0 {
+				for _, kv := range kvPairs {
+					kvContent := fmt.Sprintf("%s: %s", kv.Key, kv.Value)
+					if kvEmbed, err := m.client.GenerateEmbedding(m.config.VectorModel, kvContent); err == nil {
+						kvChunk := VectorChunk{
+							ChatID:      m.currentChat.ID,
+							Content:     kvContent,
+							ContentType: contentType,
+							Strategy:    StrategyKeyValue,
+							Embedding:   kvEmbed,
+							Metadata: ChunkMetadata{
+								UserMessage:      userMsg.Content,
+								AssistantMessage: kv.Value,
+								Timestamp:        userMsg.Timestamp,
+								ParentChunkID:    mainChunkID,
+								EntityKey:        kv.Key,
+								EntityValue:      kv.Value,
+								SearchKeywords:   kv.Keywords,
+							},
+						}
+						if err := m.vectorDB.AddChunk(kvChunk); err == nil {
+							relatedIDs = append(relatedIDs, kvChunk.ID)
+						}
+					}
+				}
+			}
+
+			// STRATEGY 4: Extract entity sheets for fictional content
+			if contentType == ContentTypeFictional {
+				if entities, err := m.client.ExtractEntitySheets(m.config.Model, userMsg.Content, assistantMsg.Content); err == nil && len(entities) > 0 {
+					for _, entity := range entities {
+						sheetContent := fmt.Sprintf("%s (%s): %s", entity.EntityName, entity.EntityType, entity.Description)
+						for k, v := range entity.Attributes {
+							sheetContent += fmt.Sprintf("\n%s: %s", k, v)
+						}
+
+						if sheetEmbed, err := m.client.GenerateEmbedding(m.config.VectorModel, sheetContent); err == nil {
+							sheetChunk := VectorChunk{
+								ChatID:      m.currentChat.ID,
+								Content:     sheetContent,
+								ContentType: contentType,
+								Strategy:    StrategyEntitySheet,
+								Embedding:   sheetEmbed,
+								Metadata: ChunkMetadata{
+									UserMessage:      userMsg.Content,
+									AssistantMessage: sheetContent,
+									Timestamp:        userMsg.Timestamp,
+									ParentChunkID:    mainChunkID,
+									EntityKey:        entity.EntityName,
+									EntityValue:      sheetContent,
+									SearchKeywords:   entity.Keywords,
+									CharacterRefs:    []string{entity.EntityName},
+								},
+							}
+							if err := m.vectorDB.AddChunk(sheetChunk); err == nil {
+								relatedIDs = append(relatedIDs, sheetChunk.ID)
+							}
+						}
+					}
+				}
+			}
+
+		}
+
+		// Link all sub-chunks to main chunk
+		if mainChunk := m.vectorDB.GetChunkByID(mainChunkID); mainChunk != nil {
+			mainChunk.Metadata.RelatedChunkIDs = relatedIDs
+		}
+	}
+
+	return nil
+}
+
+// retrieveRelevantContext searches vector DB for relevant past conversations
+func (m *model) retrieveRelevantContext(query string) (string, error) {
+	m.lastVectorResults = nil
+	m.vectorContextUsed = false
+	m.lastVectorDebug = ""
+
+	if !m.config.VectorEnabled {
+		m.lastVectorDebug = "[Vector DB disabled]"
+		return "", nil
+	}
+
+	embedding, err := m.client.GenerateEmbedding(m.config.VectorModel, query)
+	if err != nil {
+		m.lastVectorDebug = fmt.Sprintf("[Vector Error: %v]", err)
+		return "", err
+	}
+
+	// Use hybrid search for better keyword matching with fictional content
+	results := m.vectorDB.SearchHybrid(embedding, query, m.config.VectorTopK*2)
+
+	// Optionally expand with related chunks
+	if m.config.VectorIncludeRelated && len(results) > 0 {
+		expanded := make(map[string]SearchResult)
+		for _, result := range results {
+			expanded[result.Chunk.ID] = result
+
+			// Add parent context
+			if result.Chunk.Metadata.ParentChunkID != "" {
+				parent := m.vectorDB.GetChunkByID(result.Chunk.Metadata.ParentChunkID)
+				if parent != nil {
+					expanded[parent.ID] = SearchResult{
+						Chunk:      *parent,
+						Similarity: result.Similarity * 0.9,
+					}
+				}
+			}
+
+			// Add related chunks
+			for _, relatedID := range result.Chunk.Metadata.RelatedChunkIDs {
+				related := m.vectorDB.GetChunkByID(relatedID)
+				if related != nil {
+					expanded[related.ID] = SearchResult{
+						Chunk:      *related,
+						Similarity: result.Similarity * 0.85,
+					}
+				}
+			}
+		}
+
+		// Convert back to slice and sort
+		results = make([]SearchResult, 0, len(expanded))
+		for _, result := range expanded {
+			results = append(results, result)
+		}
+		sort.Slice(results, func(i, j int) bool {
+			return results[i].Similarity > results[j].Similarity
+		})
+
+		// Limit to topK after expansion
+		if len(results) > m.config.VectorTopK {
+			results = results[:m.config.VectorTopK]
+		}
+	}
+
+	m.lastVectorResults = results
+
+	var debugBuilder strings.Builder
+	debugBuilder.WriteString(fmt.Sprintf("Query: %s\n", truncateString(query, 60)))
+	debugBuilder.WriteString(fmt.Sprintf("Found %d results from vector DB\n", len(results)))
+
+	if len(results) == 0 {
+		m.lastVectorDebug = debugBuilder.String() + "No results found."
+		return "", nil
+	}
+
+	var contextBuilder strings.Builder
+	contextBuilder.WriteString("Relevant context from past conversations:\n\n")
+	usedCount := 0
+
+	for i, result := range results {
+		debugBuilder.WriteString(fmt.Sprintf("  %d. Similarity=%.4f (threshold=%.2f) ",
+			i+1, result.Similarity, m.config.VectorSimilarity))
+
+		if result.Similarity < m.config.VectorSimilarity {
+			debugBuilder.WriteString("SKIPPED\n")
+			debugBuilder.WriteString(fmt.Sprintf("     Q: %s\n", truncateString(result.Chunk.Metadata.UserMessage, 60)))
+			debugBuilder.WriteString(fmt.Sprintf("     A: %s\n", truncateString(result.Chunk.Metadata.AssistantMessage, 60)))
+			continue
+		}
+
+		debugBuilder.WriteString("USED\n")
+		debugBuilder.WriteString(fmt.Sprintf("     Q: %s\n", truncateString(result.Chunk.Metadata.UserMessage, 60)))
+		debugBuilder.WriteString(fmt.Sprintf("     A: %s\n", truncateString(result.Chunk.Metadata.AssistantMessage, 60)))
+		usedCount++
+		contextBuilder.WriteString(fmt.Sprintf("Q: %s\nA: %s\n\n",
+			result.Chunk.Metadata.UserMessage,
+			result.Chunk.Metadata.AssistantMessage))
+	}
+
+	debugBuilder.WriteString(fmt.Sprintf("\nTotal contexts injected: %d\n", usedCount))
+	m.lastVectorDebug = debugBuilder.String()
+
+	if usedCount > 0 {
+		m.vectorContextUsed = true
+		return contextBuilder.String(), nil
+	}
+
+	return "", nil
+}
+
+func (m *model) handleVectorStatsViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q":
+		m.currentView = chatListView
+		return m, nil
+	case "d":
+		m.config.VectorDebug = !m.config.VectorDebug
+		m.config.Save()
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m model) renderVectorStatsView() string {
+	title := titleStyle.Render("Vector Database Statistics & Debug")
+	help := helpStyle.Render("esc: back | d: toggle debug mode")
+
+	var content strings.Builder
+	content.WriteString(title + "\n\n")
+
+	if !m.config.VectorEnabled {
+		content.WriteString("Vector DB is currently disabled.\n")
+		content.WriteString("Enable it in Settings to start building knowledge.\n\n")
+		content.WriteString(help)
+		return content.String()
+	}
+
+	stats := m.vectorDB.GetStats()
+
+	content.WriteString(helpStyle.Render("Database Stats:") + "\n")
+	content.WriteString(fmt.Sprintf("  Total Chunks: %v\n", stats["total_chunks"]))
+	content.WriteString(fmt.Sprintf("  Unique Chats: %v\n", stats["unique_chats"]))
+	content.WriteString(fmt.Sprintf("  Marked Bad: %v\n", stats["marked_bad"]))
+	content.WriteString(fmt.Sprintf("  Verified: %v\n", stats["verified"]))
+	content.WriteString(fmt.Sprintf("  Storage: %v\n\n", stats["storage_path"]))
+
+	content.WriteString(helpStyle.Render("Configuration:") + "\n")
+	content.WriteString(fmt.Sprintf("  Model: %s\n", m.config.VectorModel))
+	content.WriteString(fmt.Sprintf("  Top-K Results: %d\n", m.config.VectorTopK))
+	content.WriteString(fmt.Sprintf("  Similarity Threshold: %.2f\n", m.config.VectorSimilarity))
+
+	debugStatus := "OFF"
+	if m.config.VectorDebug {
+		debugStatus = lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Render("ON")
+	}
+	content.WriteString(fmt.Sprintf("  Debug Mode: %s\n", debugStatus))
+
+	extractStatus := "OFF"
+	if m.config.VectorExtractMetadata {
+		extractStatus = lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Render("ON")
+	}
+	content.WriteString(fmt.Sprintf("  Metadata Extraction: %s\n", extractStatus))
+
+	relatedStatus := "OFF"
+	if m.config.VectorIncludeRelated {
+		relatedStatus = lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Render("ON")
+	}
+	content.WriteString(fmt.Sprintf("  Include Related Chunks: %s\n\n", relatedStatus))
+
+	if m.lastVectorDebug != "" {
+		content.WriteString(helpStyle.Render("Last Query Debug:") + "\n")
+		debugStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("243"))
+		content.WriteString(debugStyle.Render(m.lastVectorDebug))
+		content.WriteString("\n")
+	} else {
+		content.WriteString("No recent vector queries.\n")
+		content.WriteString("Send a message to see debug info here.\n\n")
+	}
+
+	content.WriteString(help)
+	return content.String()
+}
+
+func truncateString(s string, maxLen int) string {
+	if len(s) <= maxLen {
+		return s
+	}
+	return s[:maxLen] + "..."
+}
+
+func (m *model) handleConfirmResetViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "y", "Y":
+		// Perform reset
+		return m, m.resetAllData
+
+	case "n", "N", "esc", "q":
+		m.currentView = chatListView
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m model) renderConfirmResetView() string {
+	title := errorStyle.Render("RESET ALL DATA")
+	help := helpStyle.Render("y: confirm reset | n/esc: cancel")
+
+	var content strings.Builder
+	content.WriteString(title + "\n\n")
+
+	warningStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true)
+	content.WriteString(warningStyle.Render("WARNING: This will permanently delete:") + "\n\n")
+
+	content.WriteString("  - All chat conversations\n")
+	content.WriteString("  - All vector database embeddings\n")
+	content.WriteString("  - All indexed knowledge\n\n")
+
+	infoStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("86"))
+	content.WriteString(infoStyle.Render("Preserved:") + "\n\n")
+	content.WriteString("  - Configuration settings\n")
+	content.WriteString("  - Backups (if any)\n\n")
+
+	content.WriteString(errorStyle.Render("This action cannot be undone!") + "\n\n")
+	content.WriteString(help)
+
+	return content.String()
+}
+
+func (m *model) resetAllData() tea.Msg {
+	// Clear all chats
+	if err := m.storage.ClearAllChats(); err != nil {
+		return errMsg{err: fmt.Errorf("failed to clear chats: %w", err)}
+	}
+
+	// Clear vector DB
+	if err := m.vectorDB.ClearAll(); err != nil {
+		return errMsg{err: fmt.Errorf("failed to clear vector DB: %w", err)}
+	}
+
+	return resetCompleteMsg{}
 }
