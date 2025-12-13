@@ -1,0 +1,142 @@
+package main
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"sort"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type Message struct {
+	Role      string    `json:"role"`
+	Content   string    `json:"content"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
+type Chat struct {
+	ID        string    `json:"id"`
+	Title     string    `json:"title"`
+	Model     string    `json:"model"`
+	Messages  []Message `json:"messages"`
+	CreatedAt time.Time `json:"created_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+type Storage struct {
+	dataDir string
+}
+
+func NewStorage() (*Storage, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+
+	dataDir := filepath.Join(home, ".ollama-ui", "chats")
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return nil, err
+	}
+
+	return &Storage{dataDir: dataDir}, nil
+}
+
+func (s *Storage) CreateChat(model string) (*Chat, error) {
+	chat := &Chat{
+		ID:        uuid.New().String(),
+		Title:     "New Chat",
+		Model:     model,
+		Messages:  []Message{},
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+	}
+
+	if err := s.SaveChat(chat); err != nil {
+		return nil, err
+	}
+
+	return chat, nil
+}
+
+func (s *Storage) SaveChat(chat *Chat) error {
+	chat.UpdatedAt = time.Now()
+
+	data, err := json.MarshalIndent(chat, "", "  ")
+	if err != nil {
+		return err
+	}
+
+	path := filepath.Join(s.dataDir, chat.ID+".json")
+	return os.WriteFile(path, data, 0644)
+}
+
+func (s *Storage) LoadChat(id string) (*Chat, error) {
+	path := filepath.Join(s.dataDir, id+".json")
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	var chat Chat
+	if err := json.Unmarshal(data, &chat); err != nil {
+		return nil, err
+	}
+
+	return &chat, nil
+}
+
+func (s *Storage) ListChats() ([]*Chat, error) {
+	files, err := os.ReadDir(s.dataDir)
+	if err != nil {
+		return nil, err
+	}
+
+	var chats []*Chat
+	for _, file := range files {
+		if filepath.Ext(file.Name()) != ".json" {
+			continue
+		}
+
+		id := file.Name()[:len(file.Name())-5]
+		chat, err := s.LoadChat(id)
+		if err != nil {
+			continue
+		}
+
+		chats = append(chats, chat)
+	}
+
+	sort.Slice(chats, func(i, j int) bool {
+		return chats[i].UpdatedAt.After(chats[j].UpdatedAt)
+	})
+
+	return chats, nil
+}
+
+func (s *Storage) DeleteChat(id string) error {
+	path := filepath.Join(s.dataDir, id+".json")
+	return os.Remove(path)
+}
+
+func (s *Storage) AddMessage(chat *Chat, role, content string) error {
+	msg := Message{
+		Role:      role,
+		Content:   content,
+		Timestamp: time.Now(),
+	}
+
+	chat.Messages = append(chat.Messages, msg)
+
+	if len(chat.Messages) <= 2 && chat.Title == "New Chat" {
+		if len(content) > 50 {
+			chat.Title = content[:50] + "..."
+		} else {
+			chat.Title = content
+		}
+	}
+
+	return s.SaveChat(chat)
+}
