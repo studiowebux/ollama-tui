@@ -28,13 +28,16 @@ const (
 type ChunkStrategy string
 
 const (
-	StrategyFullQA       ChunkStrategy = "full_qa"        // Complete Q&A pair
-	StrategySentence     ChunkStrategy = "sentence"       // Individual sentence
-	StrategyKeyValue     ChunkStrategy = "key_value"      // Entity: Description
-	StrategyWhoWhatWhy   ChunkStrategy = "who_what_why"   // Structured Q&A
-	StrategyKeyword      ChunkStrategy = "keyword"        // Keyword-based
-	StrategyEntitySheet  ChunkStrategy = "entity_sheet"   // Character/location sheet
-	StrategyQuestionKey  ChunkStrategy = "question_key"   // Generated question as key, content as answer
+	StrategyFullQA          ChunkStrategy = "full_qa"          // Complete Q&A pair
+	StrategySentence        ChunkStrategy = "sentence"         // Individual sentence
+	StrategyKeyValue        ChunkStrategy = "key_value"        // Entity: Description
+	StrategyWhoWhatWhy      ChunkStrategy = "who_what_why"     // Structured Q&A
+	StrategyKeyword         ChunkStrategy = "keyword"          // Keyword-based
+	StrategyEntitySheet     ChunkStrategy = "entity_sheet"     // Character/location sheet
+	StrategyQuestionKey     ChunkStrategy = "question_key"     // Generated question as key, content as answer
+	StrategyDocumentSection ChunkStrategy = "document_section" // Markdown section
+	StrategyCodeSnippet     ChunkStrategy = "code_snippet"     // Code with one-liner summary
+	StrategyDocumentFull    ChunkStrategy = "document_full"    // Full document
 )
 
 // StoredContent represents deduplicated content
@@ -103,6 +106,13 @@ type ChunkMetadata struct {
 	// Sentence-level granularity
 	SentenceIndex int    `json:"sentence_index"` // Position in original text
 	OriginalText  string `json:"original_text"`  // Full original message
+
+	// Document import fields
+	SourceDocument string `json:"source_document"` // File path for imported documents
+	DocumentType   string `json:"document_type"`   // markdown, go, typescript, etc
+	DocumentHash   string `json:"document_hash"`   // SHA256 hash of source document
+	CodeLanguage   string `json:"code_language"`   // Programming language for code snippets
+	CodeContext    string `json:"code_context"`    // Function/class name for code
 }
 
 // ContentStore manages deduplicated content
@@ -495,6 +505,16 @@ func (db *VectorDB) GetChunkByID(id string) *VectorChunk {
 		}
 	}
 	return nil
+}
+
+// HasDocumentHash checks if a document with this hash has already been imported
+func (db *VectorDB) HasDocumentHash(hash string) bool {
+	for _, chunk := range db.chunks {
+		if chunk.Metadata.DocumentHash == hash {
+			return true
+		}
+	}
+	return false
 }
 
 // SearchWithContext expands results with related chunks

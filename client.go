@@ -137,6 +137,12 @@ func (c *OllamaClient) StreamChat(model string, messages []ChatMessage, onChunk 
 	}
 
 	scanner := bufio.NewScanner(resp.Body)
+	// Increase buffer size to handle large responses (default is 64KB)
+	// Set to 10MB to handle very long responses
+	const maxScanTokenSize = 10 * 1024 * 1024
+	buf := make([]byte, maxScanTokenSize)
+	scanner.Buffer(buf, maxScanTokenSize)
+
 	for scanner.Scan() {
 		line := scanner.Text()
 		if line == "" {

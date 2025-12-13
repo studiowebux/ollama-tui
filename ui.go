@@ -2,8 +2,11 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/charmbracelet/bubbles/textarea"
 	"github.com/charmbracelet/bubbles/viewport"
@@ -24,6 +27,7 @@ const (
 	chunkDetailView
 	refineChunkView
 	refineDiffView
+	documentImportView
 )
 
 type model struct {
@@ -72,6 +76,21 @@ type model struct {
 	lastVectorResults []SearchResult
 	vectorContextUsed bool
 	lastVectorDebug   string
+
+	// Document import
+	docImporter        *DocumentImporter
+	importPath         string
+	importProgress     string
+	importing          bool
+	scannedFiles       []string
+	importCursor       int
+	importProgressChan chan string
+
+	// Vector stats view scroll
+	vectorStatsScroll int
+
+	// Chunk detail view scroll
+	chunkDetailScroll int
 }
 
 type streamChunkMsg string
@@ -187,6 +206,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleRefineDiffViewKeys(msg)
 		case confirmResetView:
 			return m.handleConfirmResetViewKeys(msg)
+		case documentImportView:
+			return m.handleDocumentImportViewKeys(msg)
 		}
 
 	case streamStartMsg:
@@ -259,6 +280,24 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			close(m.vectorProgressChan)
 			m.vectorProgressChan = nil
 		}
+		return m, nil
+
+	case scanCompleteMsg:
+		m.scannedFiles = msg.files
+		return m, nil
+
+	case importProgressMsg:
+		m.importProgress = msg.message
+		// Continue listening for more progress (channel might still have messages)
+		if m.importProgressChan != nil {
+			return m, m.waitForImportProgress(m.importProgressChan)
+		}
+		return m, nil
+
+	case importCompleteMsg:
+		m.importing = false
+		m.importProgressChan = nil
+		// Keep the last progress message visible
 		return m, nil
 
 	case switchProjectMsg:
@@ -335,6 +374,8 @@ func (m model) View() string {
 		return m.renderRefineChunkView()
 	case refineDiffView:
 		return m.renderRefineDiffView()
+	case documentImportView:
+		return m.renderDocumentImportView()
 	}
 	return ""
 }
@@ -399,7 +440,7 @@ func (m model) renderChatListView() string {
 	}
 	title := titleStyle.Render(fmt.Sprintf("Chat History - Project: %s", projectName))
 	modelInfo := helpStyle.Render(fmt.Sprintf("Current model: %s", m.config.Model))
-	help := helpStyle.Render("↑/↓: navigate | enter: open | n: new chat | d: delete | p: projects | k: knowledge base | s: settings | v: vector stats | r: reset all | q: quit")
+	help := helpStyle.Render("↑/↓: navigate | enter: open | n: new chat | d: delete | p: projects | k: KB | i: import docs | s: settings | v: vector stats | r: reset all | q: quit")
 
 	var content strings.Builder
 	content.WriteString(title + " - " + modelInfo + "\n\n")
@@ -649,6 +690,13 @@ func (m *model) handleChatListViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.kbCursor = 0
 		m.currentView = knowledgeBaseView
 		return m, nil
+
+	case "i":
+		m.importPath = "."
+		m.scannedFiles = nil
+		m.importCursor = 0
+		m.currentView = documentImportView
+		return m, m.scanDirectory()
 
 	case "r":
 		m.currentView = confirmResetView
@@ -1544,20 +1592,43 @@ func (m *model) retrieveRelevantContext(query string) (string, error) {
 		debugBuilder.WriteString(fmt.Sprintf("  %d. Similarity=%.4f (threshold=%.2f) ",
 			i+1, result.Similarity, m.config.VectorSimilarity))
 
+		// Determine source and content based on chunk type
+		var question, answer string
+		if result.Chunk.Metadata.SourceDocument != "" {
+			// Document import chunk
+			question = truncateString(result.Chunk.Content, 60) // Summary/question
+			answer = truncateString(result.Chunk.CanonicalAnswer, 60) // Code/content
+			if result.Chunk.Metadata.SourceDocument != "" {
+				debugBuilder.WriteString(fmt.Sprintf("[%s] ", result.Chunk.Metadata.SourceDocument))
+			}
+		} else {
+			// Conversation chunk
+			question = truncateString(result.Chunk.Metadata.UserMessage, 60)
+			answer = truncateString(result.Chunk.Metadata.AssistantMessage, 60)
+		}
+
 		if result.Similarity < m.config.VectorSimilarity {
 			debugBuilder.WriteString("SKIPPED\n")
-			debugBuilder.WriteString(fmt.Sprintf("     Q: %s\n", truncateString(result.Chunk.Metadata.UserMessage, 60)))
-			debugBuilder.WriteString(fmt.Sprintf("     A: %s\n", truncateString(result.Chunk.Metadata.AssistantMessage, 60)))
+			debugBuilder.WriteString(fmt.Sprintf("     Q: %s\n", question))
+			debugBuilder.WriteString(fmt.Sprintf("     A: %s\n", answer))
 			continue
 		}
 
 		debugBuilder.WriteString("USED\n")
-		debugBuilder.WriteString(fmt.Sprintf("     Q: %s\n", truncateString(result.Chunk.Metadata.UserMessage, 60)))
-		debugBuilder.WriteString(fmt.Sprintf("     A: %s\n", truncateString(result.Chunk.Metadata.AssistantMessage, 60)))
+		debugBuilder.WriteString(fmt.Sprintf("     Q: %s\n", question))
+		debugBuilder.WriteString(fmt.Sprintf("     A: %s\n", answer))
 		usedCount++
-		contextBuilder.WriteString(fmt.Sprintf("Q: %s\nA: %s\n\n",
-			result.Chunk.Metadata.UserMessage,
-			result.Chunk.Metadata.AssistantMessage))
+
+		// Build context based on chunk type
+		if result.Chunk.Metadata.SourceDocument != "" {
+			contextBuilder.WriteString(fmt.Sprintf("Q: %s\nA: %s\n\n",
+				result.Chunk.Content,
+				result.Chunk.CanonicalAnswer))
+		} else {
+			contextBuilder.WriteString(fmt.Sprintf("Q: %s\nA: %s\n\n",
+				result.Chunk.Metadata.UserMessage,
+				result.Chunk.Metadata.AssistantMessage))
+		}
 	}
 
 	debugBuilder.WriteString(fmt.Sprintf("\nTotal contexts injected: %d\n", usedCount))
@@ -1575,10 +1646,31 @@ func (m *model) handleVectorStatsViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc", "q":
 		m.currentView = chatListView
+		m.vectorStatsScroll = 0
 		return m, nil
 	case "d":
 		m.config.VectorDebug = !m.config.VectorDebug
 		m.config.Save()
+		return m, nil
+	case "up", "k":
+		if m.vectorStatsScroll > 0 {
+			m.vectorStatsScroll--
+		}
+		return m, nil
+	case "down", "j":
+		m.vectorStatsScroll++
+		return m, nil
+	case "pgup":
+		m.vectorStatsScroll -= 10
+		if m.vectorStatsScroll < 0 {
+			m.vectorStatsScroll = 0
+		}
+		return m, nil
+	case "pgdown":
+		m.vectorStatsScroll += 10
+		return m, nil
+	case "home":
+		m.vectorStatsScroll = 0
 		return m, nil
 	}
 	return m, nil
@@ -1586,7 +1678,7 @@ func (m *model) handleVectorStatsViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func (m model) renderVectorStatsView() string {
 	title := titleStyle.Render("Vector Database Statistics & Debug")
-	help := helpStyle.Render("esc: back | d: toggle debug mode")
+	help := helpStyle.Render("↑/↓/PgUp/PgDn: scroll | d: toggle debug | esc: back")
 
 	var content strings.Builder
 	content.WriteString(title + "\n\n")
@@ -1688,14 +1780,52 @@ func (m model) renderVectorStatsView() string {
 	}
 
 	content.WriteString(help)
-	return content.String()
+
+	// Apply scrolling
+	fullContent := content.String()
+	lines := strings.Split(fullContent, "\n")
+
+	// Calculate visible window
+	maxLines := m.height - 2 // Leave room for borders
+	if maxLines < 10 {
+		maxLines = 10
+	}
+
+	startLine := m.vectorStatsScroll
+	if startLine >= len(lines) {
+		startLine = len(lines) - 1
+		if startLine < 0 {
+			startLine = 0
+		}
+	}
+
+	endLine := startLine + maxLines
+	if endLine > len(lines) {
+		endLine = len(lines)
+	}
+
+	// Show scroll indicator if content is larger than viewport
+	visibleLines := lines[startLine:endLine]
+	result := strings.Join(visibleLines, "\n")
+
+	if len(lines) > maxLines {
+		scrollInfo := fmt.Sprintf("\n[Line %d-%d of %d]", startLine+1, endLine, len(lines))
+		result += helpStyle.Render(scrollInfo)
+	}
+
+	return result
 }
 
 func truncateString(s string, maxLen int) string {
-	if len(s) <= maxLen {
-		return s
+	// Flatten newlines and normalize whitespace
+	flattened := strings.ReplaceAll(s, "\n", " ")
+	flattened = strings.ReplaceAll(flattened, "\r", " ")
+	flattened = strings.Join(strings.Fields(flattened), " ")
+
+	if len(flattened) <= maxLen {
+		return flattened
 	}
-	return s[:maxLen] + "..."
+	return flattened[:maxLen] + "..."
 }
 
 func (m *model) handleConfirmResetViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1748,4 +1878,242 @@ func (m *model) resetAllData() tea.Msg {
 	}
 
 	return resetCompleteMsg{}
+}
+
+// Document Import View
+func (m model) renderDocumentImportView() string {
+	title := titleStyle.Render("Document Import - Build Knowledge Base")
+	help := helpStyle.Render("↑/↓: navigate | enter: import | a: import all | esc: back")
+
+	var content strings.Builder
+	content.WriteString(title + "\n\n")
+	content.WriteString(helpStyle.Render(fmt.Sprintf("Path: %s", m.importPath)) + "\n\n")
+
+	if m.importing {
+		content.WriteString(fmt.Sprintf("Importing... %s\n", m.importProgress))
+		return content.String()
+	}
+
+	if len(m.scannedFiles) == 0 {
+		content.WriteString(helpStyle.Render("No supported files found. Scanning for .md, .go, .ts, .js, .py, .rs files...") + "\n")
+	} else {
+		content.WriteString(helpStyle.Render(fmt.Sprintf("Found %d files:\n", len(m.scannedFiles))))
+
+		// Calculate display window
+		maxVisible := 20
+		displayStart := 0
+		displayEnd := len(m.scannedFiles)
+
+		if len(m.scannedFiles) > maxVisible {
+			// Center cursor in window
+			displayStart = m.importCursor - maxVisible/2
+			if displayStart < 0 {
+				displayStart = 0
+			}
+			displayEnd = displayStart + maxVisible
+			if displayEnd > len(m.scannedFiles) {
+				displayEnd = len(m.scannedFiles)
+				displayStart = displayEnd - maxVisible
+				if displayStart < 0 {
+					displayStart = 0
+				}
+			}
+		}
+
+		for i := displayStart; i < displayEnd; i++ {
+			// Skip invalid entries
+			if i >= len(m.scannedFiles) || m.scannedFiles[i] == "" {
+				continue
+			}
+
+			cursor := " "
+			if i == m.importCursor {
+				cursor = ">"
+			}
+
+			// Show relative path or basename for cleaner display
+			displayPath := m.scannedFiles[i]
+			if relPath, err := filepath.Rel(m.importPath, displayPath); err == nil && relPath != "" && relPath != "." {
+				displayPath = relPath
+			} else {
+				// Fallback to basename if Rel fails
+				displayPath = filepath.Base(displayPath)
+			}
+
+			// Skip empty paths
+			if displayPath == "" || displayPath == "." {
+				displayPath = m.scannedFiles[i]
+			}
+
+			// Get file size
+			sizeStr := ""
+			if info, err := os.Stat(m.scannedFiles[i]); err == nil {
+				size := info.Size()
+				if size < 1024 {
+					sizeStr = fmt.Sprintf("%dB", size)
+				} else if size < 1024*1024 {
+					sizeStr = fmt.Sprintf("%.1fK", float64(size)/1024)
+				} else {
+					sizeStr = fmt.Sprintf("%.1fM", float64(size)/(1024*1024))
+				}
+			}
+
+			fileLine := fmt.Sprintf("%s %-50s %8s", cursor, displayPath, sizeStr)
+			if i == m.importCursor {
+				fileLine = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Render(fileLine)
+			}
+			content.WriteString(fileLine + "\n")
+		}
+
+		content.WriteString(helpStyle.Render(fmt.Sprintf("\nShowing %d-%d of %d", displayStart+1, displayEnd, len(m.scannedFiles))) + "\n")
+	}
+
+	content.WriteString("\n" + help)
+	return content.String()
+}
+
+func (m *model) handleDocumentImportViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "esc", "q":
+		m.currentView = chatListView
+		return m, m.loadChats
+
+	case "up", "k":
+		if m.importCursor > 0 {
+			m.importCursor--
+		}
+
+	case "down", "j":
+		if m.importCursor < len(m.scannedFiles)-1 {
+			m.importCursor++
+		}
+
+	case "enter":
+		if len(m.scannedFiles) > 0 && !m.importing {
+			m.importing = true
+			m.importProgressChan = make(chan string, 100)
+			return m, m.importDocument(m.scannedFiles[m.importCursor])
+		}
+
+	case "a", "A":
+		if len(m.scannedFiles) > 0 && !m.importing {
+			m.importing = true
+			m.importProgressChan = make(chan string, 100)
+			return m, m.importAllDocuments()
+		}
+	}
+
+	return m, nil
+}
+
+func (m *model) scanDirectory() tea.Cmd {
+	return func() tea.Msg {
+		if m.docImporter == nil {
+			m.docImporter = NewDocumentImporter(m.client, m.vectorDB, m.importPath)
+		}
+
+		files, err := m.docImporter.ScanDirectory(m.importPath)
+		if err != nil {
+			return errMsg{err: err}
+		}
+
+		return scanCompleteMsg{files: files}
+	}
+}
+
+type importProgressMsg struct {
+	message string
+}
+
+type importCompleteMsg struct{}
+
+type scanCompleteMsg struct {
+	files []string
+}
+
+func (m *model) importDocument(filePath string) tea.Cmd {
+	return func() tea.Msg {
+		if m.docImporter == nil {
+			m.docImporter = NewDocumentImporter(m.client, m.vectorDB, m.importPath)
+		}
+
+		// Start import in goroutine
+		go func() {
+			m.importProgressChan <- fmt.Sprintf("Starting: %s", filepath.Base(filePath))
+			err := m.docImporter.ImportDocument(filePath, m.config.Model, m.config.VectorModel, m.importProgressChan)
+
+			if err != nil {
+				m.importProgressChan <- fmt.Sprintf("Error: %v", err)
+			} else {
+				m.importProgressChan <- "Complete!"
+			}
+			close(m.importProgressChan)
+		}()
+
+		// Return first message to start the chain
+		return m.waitForImportProgress(m.importProgressChan)()
+	}
+}
+
+func (m *model) waitForImportProgress(progressChan chan string) tea.Cmd {
+	return func() tea.Msg {
+		if progressChan == nil {
+			return importCompleteMsg{}
+		}
+		msg, ok := <-progressChan
+		if !ok {
+			// Channel closed, import done
+			return importCompleteMsg{}
+		}
+		// Send progress and continue listening
+		return importProgressMsg{message: msg}
+	}
+}
+
+func (m *model) importAllDocuments() tea.Cmd {
+	return func() tea.Msg {
+		if m.docImporter == nil {
+			m.docImporter = NewDocumentImporter(m.client, m.vectorDB, m.importPath)
+		}
+
+		totalFiles := len(m.scannedFiles)
+
+		// Start import in goroutine
+		go func() {
+			chunksBefore := len(m.vectorDB.GetAllChunks())
+			imported := 0
+			skipped := 0
+			failed := 0
+
+			for i, filePath := range m.scannedFiles {
+				m.importProgressChan <- fmt.Sprintf("[%d/%d] %s", i+1, totalFiles, filepath.Base(filePath))
+
+				err := m.docImporter.ImportDocument(filePath, m.config.Model, m.config.VectorModel, m.importProgressChan)
+				if err != nil {
+					if strings.Contains(err.Error(), "already imported") {
+						skipped++
+					} else {
+						failed++
+						m.importProgressChan <- fmt.Sprintf("  Error: %v", err)
+					}
+				} else {
+					imported++
+				}
+			}
+
+			chunksAfter := len(m.vectorDB.GetAllChunks())
+			newChunks := chunksAfter - chunksBefore
+
+			summary := fmt.Sprintf("\nComplete! Files: %d imported, %d skipped, %d failed | New chunks: %d",
+				imported, skipped, failed, newChunks)
+			m.importProgressChan <- summary
+
+			// Give UI time to display final message before closing
+			time.Sleep(100 * time.Millisecond)
+			close(m.importProgressChan)
+		}()
+
+		// Return first message to start the chain
+		return m.waitForImportProgress(m.importProgressChan)()
+	}
 }

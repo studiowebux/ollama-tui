@@ -245,7 +245,7 @@ func (m *model) handleKnowledgeBaseViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd)
 // Chunk Detail View
 func (m model) renderChunkDetailView() string {
 	title := titleStyle.Render("Chunk Details")
-	help := helpStyle.Render("r: refine with LLM | b: mark bad | v: mark verified | d: delete | esc: back")
+	help := helpStyle.Render("↑/↓/PgUp/PgDn: scroll | r: refine | b: bad | v: verify | d: delete | esc: back")
 
 	var content strings.Builder
 	content.WriteString(title + "\n\n")
@@ -326,13 +326,72 @@ func (m model) renderChunkDetailView() string {
 	}
 
 	content.WriteString("\n" + help)
-	return content.String()
+
+	// Apply scrolling
+	fullContent := content.String()
+	lines := strings.Split(fullContent, "\n")
+
+	// Calculate visible window
+	maxLines := m.height - 2
+	if maxLines < 10 {
+		maxLines = 10
+	}
+
+	startLine := m.chunkDetailScroll
+	if startLine >= len(lines) {
+		startLine = len(lines) - 1
+		if startLine < 0 {
+			startLine = 0
+		}
+	}
+
+	endLine := startLine + maxLines
+	if endLine > len(lines) {
+		endLine = len(lines)
+	}
+
+	// Show visible content
+	visibleLines := lines[startLine:endLine]
+	result := strings.Join(visibleLines, "\n")
+
+	if len(lines) > maxLines {
+		scrollInfo := fmt.Sprintf("\n[Line %d-%d of %d]", startLine+1, endLine, len(lines))
+		result += helpStyle.Render(scrollInfo)
+	}
+
+	return result
 }
 
 func (m *model) handleChunkDetailViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc", "q":
 		m.currentView = knowledgeBaseView
+		m.chunkDetailScroll = 0
+		return m, nil
+
+	case "up", "k":
+		if m.chunkDetailScroll > 0 {
+			m.chunkDetailScroll--
+		}
+		return m, nil
+
+	case "down", "j":
+		m.chunkDetailScroll++
+		return m, nil
+
+	case "pgup":
+		m.chunkDetailScroll -= 10
+		if m.chunkDetailScroll < 0 {
+			m.chunkDetailScroll = 0
+		}
+		return m, nil
+
+	case "pgdown":
+		m.chunkDetailScroll += 10
+		return m, nil
+
+	case "home":
+		m.chunkDetailScroll = 0
 		return m, nil
 
 	case "r":
@@ -386,23 +445,29 @@ func (m *model) handleChunkDetailViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 func getStrategyBadge(strategy ChunkStrategy) string {
 	badgeColors := map[ChunkStrategy]string{
-		StrategyFullQA:       "99",  // Purple
-		StrategySentence:     "208", // Orange
-		StrategyKeyValue:     "86",  // Green
-		StrategyWhoWhatWhy:   "33",  // Blue
-		StrategyEntitySheet:  "205", // Pink
-		StrategyKeyword:      "214", // Yellow
-		StrategyQuestionKey:  "51",  // Cyan
+		StrategyFullQA:          "99",  // Purple
+		StrategySentence:        "208", // Orange
+		StrategyKeyValue:        "86",  // Green
+		StrategyWhoWhatWhy:      "33",  // Blue
+		StrategyEntitySheet:     "205", // Pink
+		StrategyKeyword:         "214", // Yellow
+		StrategyQuestionKey:     "51",  // Cyan
+		StrategyDocumentSection: "45",  // Teal
+		StrategyCodeSnippet:     "207", // Magenta
+		StrategyDocumentFull:    "111", // Light Blue
 	}
 
 	badgeNames := map[ChunkStrategy]string{
-		StrategyFullQA:       "FULL",
-		StrategySentence:     "SENT",
-		StrategyKeyValue:     "K:V",
-		StrategyWhoWhatWhy:   "5W1H",
-		StrategyEntitySheet:  "ENT",
-		StrategyKeyword:      "KEY",
-		StrategyQuestionKey:  "Q=>A",
+		StrategyFullQA:          "FULL",
+		StrategySentence:        "SENT",
+		StrategyKeyValue:        "K:V",
+		StrategyWhoWhatWhy:      "5W1H",
+		StrategyEntitySheet:     "ENT",
+		StrategyKeyword:         "KEY",
+		StrategyQuestionKey:     "Q=>A",
+		StrategyDocumentSection: "DOC",
+		StrategyCodeSnippet:     "CODE",
+		StrategyDocumentFull:    "FILE",
 	}
 
 	color, ok := badgeColors[strategy]

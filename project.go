@@ -27,7 +27,7 @@ func NewProjectManager() (*ProjectManager, error) {
 		return nil, err
 	}
 
-	projectsDir := filepath.Join(home, ".ollama-ui", "projects")
+	projectsDir := filepath.Join(home, ".ollama-tui", "projects")
 	if err := os.MkdirAll(projectsDir, 0755); err != nil {
 		return nil, err
 	}
