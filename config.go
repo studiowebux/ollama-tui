@@ -60,7 +60,7 @@ func LoadConfig() (*Config, error) {
 		CurrentProject:        "default",
 		VectorEnabled:         true,
 		VectorModel:           "nomic-embed-text",
-		VectorTopK:            3,
+		VectorTopK:            5,     // Default: 5 chunks (reasonable for most queries)
 		VectorSimilarity:      0.7,
 		VectorDebug:           false,
 		VectorExtractMetadata: true,

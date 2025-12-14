@@ -99,9 +99,26 @@ func (r *RAGEngine) RetrieveContext(query string) (*RAGResult, error) {
 		return results[i].Similarity > results[j].Similarity
 	})
 
-	// Limit to initial topK
-	if len(results) > r.config.VectorTopK*2 {
-		results = results[:r.config.VectorTopK*2]
+	// After sorting, keep only top results that meet similarity threshold
+	// Filter by threshold first
+	filtered := make([]SearchResult, 0)
+	for _, result := range results {
+		if result.Similarity >= r.config.VectorSimilarity {
+			filtered = append(filtered, result)
+		}
+	}
+	results = filtered
+
+	// Limit to topK with sanity cap
+	// Enforce max 20 chunks regardless of config (more than 20 overwhelms LLMs)
+	maxChunks := r.config.VectorTopK
+	cappedTopK := false
+	if maxChunks > 20 {
+		maxChunks = 20
+		cappedTopK = true
+	}
+	if len(results) > maxChunks {
+		results = results[:maxChunks]
 	}
 
 	// Optionally expand with related chunks
@@ -154,6 +171,9 @@ func (r *RAGEngine) RetrieveContext(query string) (*RAGResult, error) {
 	var debugBuilder strings.Builder
 	debugBuilder.WriteString(fmt.Sprintf("Query: %s\n", truncateString(query, 60)))
 	debugBuilder.WriteString(fmt.Sprintf("Found %d results from vector DB\n", len(results)))
+	if cappedTopK {
+		debugBuilder.WriteString(fmt.Sprintf("Warning: vector_top_k=%d is too high, capped at 20 chunks\n", r.config.VectorTopK))
+	}
 
 	if len(results) == 0 {
 		result.DebugInfo = debugBuilder.String() + "No results found."
