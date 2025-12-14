@@ -21,6 +21,7 @@ type Config struct {
 	VectorIncludeRelated  bool    `json:"vector_include_related"`
 	VectorLightMode       bool    `json:"vector_light_mode"`       // Skip heavy extractions for slow systems
 	VectorFuzzyThreshold  int     `json:"vector_fuzzy_threshold"`  // 0=disabled, 1-3=max edit distance for fuzzy matching
+	VectorCompressContext bool    `json:"vector_compress_context"` // Use LLM to compress context to key facts (slower but more accurate)
 
 	// Iterative refinement settings
 	EnableRefinement           bool    `json:"enable_refinement"`             // Enable iterative refinement
@@ -67,6 +68,7 @@ func LoadConfig() (*Config, error) {
 		VectorIncludeRelated:  false,
 		VectorLightMode:       false,
 		VectorFuzzyThreshold:  2, // Default: edit distance <= 2 for fuzzy matching
+		VectorCompressContext: false, // Disabled by default (adds LLM call overhead)
 
 		// Refinement defaults (prioritize quality)
 		EnableRefinement:           true,

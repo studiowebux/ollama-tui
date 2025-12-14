@@ -191,7 +191,14 @@ Now use this context to answer the user's question:`,
 	finalAnswer := response
 	var refinementResult *RefinementResult
 
-	if config.EnableRefinement {
+	// Skip refinement for queries with explicit word limits (they want brief answers)
+	hasWordLimit := strings.Contains(strings.ToLower(cmd.QueryPrompt), "words") &&
+		(strings.Contains(strings.ToLower(cmd.QueryPrompt), "max") ||
+		 strings.Contains(strings.ToLower(cmd.QueryPrompt), "limit") ||
+		 strings.Contains(strings.ToLower(cmd.QueryPrompt), "brief") ||
+		 strings.Contains(strings.ToLower(cmd.QueryPrompt), "short"))
+
+	if config.EnableRefinement && !hasWordLimit {
 		refinementEngine := NewRefinementEngine(client, ragEngine, config, mlScorer)
 
 		progressChan := make(chan string, 10)

@@ -8,17 +8,20 @@ import (
 
 // RAGEngine handles retrieval-augmented generation
 type RAGEngine struct {
-	client   *OllamaClient
-	vectorDB *VectorDB
-	config   *Config
+	client     *OllamaClient
+	vectorDB   *VectorDB
+	config     *Config
+	compressor *ContextCompressor
 }
 
 // NewRAGEngine creates a new RAG engine
 func NewRAGEngine(client *OllamaClient, vectorDB *VectorDB, config *Config) *RAGEngine {
+	compressor := NewContextCompressor(client, config.Model)
 	return &RAGEngine{
-		client:   client,
-		vectorDB: vectorDB,
-		config:   config,
+		client:     client,
+		vectorDB:   vectorDB,
+		config:     config,
+		compressor: compressor,
 	}
 }
 
@@ -210,7 +213,26 @@ func (r *RAGEngine) RetrieveContext(query string) (*RAGResult, error) {
 
 	if usedCount > 0 {
 		result.ContextUsed = true
-		result.Context = contextBuilder.String()
+		rawContext := contextBuilder.String()
+
+		// Optionally compress context to key facts
+		if r.config.VectorCompressContext {
+			// Only compress if we have many chunks or very long context
+			if usedCount > 5 || len(rawContext) > 2000 {
+				compressed, err := r.compressor.CompressContext(query, results, r.config.VectorTopK)
+				if err == nil && compressed != "" {
+					result.Context = "Key facts from knowledge base:\n\n" + compressed
+					debugBuilder.WriteString(fmt.Sprintf("Context compressed: %d → %d chars\n", len(rawContext), len(compressed)))
+					result.DebugInfo = debugBuilder.String()
+				} else {
+					result.Context = rawContext
+				}
+			} else {
+				result.Context = rawContext
+			}
+		} else {
+			result.Context = rawContext
+		}
 	}
 
 	return result, nil
