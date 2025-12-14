@@ -1,8 +1,6 @@
 package main
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -108,70 +106,9 @@ func (di *DocumentImporter) ScanDirectory(dirPath string) ([]string, error) {
 	return files, err
 }
 
-// ImportDocument imports a single document and vectorizes it
+// ImportDocument imports a single document and vectorizes it using all strategies
 func (di *DocumentImporter) ImportDocument(filePath, model, embedModel string, progressChan chan<- string) error {
-	content, err := os.ReadFile(filePath)
-	if err != nil {
-		return fmt.Errorf("failed to read file: %w", err)
-	}
-
-	// Check for empty files
-	if len(content) == 0 {
-		return fmt.Errorf("file is empty")
-	}
-
-	info, err := os.Stat(filePath)
-	if err != nil {
-		return fmt.Errorf("failed to stat file: %w", err)
-	}
-
-	ext := strings.ToLower(filepath.Ext(filePath))
-	supportedExts := di.SupportedExtensions()
-	docType, ok := supportedExts[ext]
-	if !ok {
-		docType = DocTypeOther
-	}
-
-	relPath, _ := filepath.Rel(di.basePath, filePath)
-	contentStr := string(content)
-
-	// Check minimum content length
-	if len(strings.TrimSpace(contentStr)) < 10 {
-		return fmt.Errorf("file content too short (< 10 chars)")
-	}
-
-	// Calculate hash
-	hash := sha256.Sum256(content)
-	hashStr := hex.EncodeToString(hash[:])
-
-	// Check if this document hash already exists
-	if di.vectorDB.HasDocumentHash(hashStr) {
-		if progressChan != nil {
-			progressChan <- fmt.Sprintf("Skipped (already imported): %s", relPath)
-		}
-		return nil
-	}
-
-	doc := ImportedDocument{
-		ID:           hashStr,
-		FilePath:     filePath,
-		RelativePath: relPath,
-		Type:         docType,
-		Content:      contentStr,
-		Hash:         hashStr,
-		ImportedAt:   time.Now(),
-		LastModified: info.ModTime(),
-	}
-
-	// Process based on type
-	switch docType {
-	case DocTypeMarkdown:
-		return di.processMarkdown(doc, model, embedModel, progressChan)
-	case DocTypeGo, DocTypeTypeScript, DocTypeJavaScript, DocTypePython, DocTypeRust:
-		return di.processCode(doc, model, embedModel, progressChan)
-	default:
-		return di.processGeneric(doc, model, embedModel, progressChan)
-	}
+	return di.ImportDocumentWithStrategy(filePath, model, embedModel, "all", false, progressChan)
 }
 
 // processMarkdown handles markdown documents
