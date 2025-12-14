@@ -12,6 +12,7 @@ var (
 	QueryModel   string
 	QueryProject string
 	QueryVerbose bool
+	QueryRate    bool // Prompt for rating after answer
 )
 
 // QueryRunner is the function that actually runs the query (defined in main package)
@@ -47,6 +48,7 @@ func init() {
 	queryCmd.Flags().StringVarP(&QueryModel, "model", "m", "", "Model to use (default: from config)")
 	queryCmd.Flags().StringVar(&QueryProject, "project", "", "Target project (default: current project from config)")
 	queryCmd.Flags().BoolVarP(&QueryVerbose, "verbose", "v", false, "Show detailed debug information")
+	queryCmd.Flags().BoolVarP(&QueryRate, "rate", "r", false, "Prompt to rate the answer (for ML training)")
 
 	queryCmd.MarkFlagRequired("prompt")
 }

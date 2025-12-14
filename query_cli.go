@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"ollamatui/cmd"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 )
 
 func init() {
@@ -251,4 +254,87 @@ Now use this context to answer the user's question:`,
 			fmt.Printf("  Passes performed: %d\n", refinementResult.PassesPerformed)
 		}
 	}
+
+	// Prompt for rating if requested
+	if cmd.QueryRate {
+		rating, err := promptForRating()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error reading rating: %v\n", err)
+		} else if rating > 0 {
+			// Initialize storage for saving rating
+			userStorage, err := NewStorage(pm, cmd.QueryProject)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Error initializing storage: %v\n", err)
+			} else {
+				err = saveQueryRating(userStorage, cmd.QueryPrompt, finalAnswer, rating, ragResult, config)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Error saving rating: %v\n", err)
+				} else {
+					fmt.Printf("\n✓ Rating saved: %s (%d/5)\n", strings.Repeat("⭐", rating)+strings.Repeat("☆", 5-rating), rating)
+				}
+			}
+		}
+	}
+}
+
+// promptForRating prompts user for a 1-5 star rating
+func promptForRating() (int, error) {
+	fmt.Print("\nRate this answer (1-5 stars, or 0 to skip): ")
+	reader := bufio.NewReader(os.Stdin)
+	input, err := reader.ReadString('\n')
+	if err != nil {
+		return 0, err
+	}
+
+	input = strings.TrimSpace(input)
+	if input == "" || input == "0" {
+		return 0, nil
+	}
+
+	rating, err := strconv.Atoi(input)
+	if err != nil || rating < 1 || rating > 5 {
+		fmt.Println("Invalid rating. Skipping.")
+		return 0, nil
+	}
+
+	return rating, nil
+}
+
+// saveQueryRating saves a rating for a CLI query
+func saveQueryRating(storage *Storage, query, answer string, rating int, ragResult *RAGResult, config *Config) error {
+	// Create a temporary chat to store the rating
+	chat := &Chat{
+		ID:        fmt.Sprintf("query_%d", time.Now().Unix()),
+		Title:     "CLI Query",
+		Model:     config.Model,
+		CreatedAt: time.Now(),
+		UpdatedAt: time.Now(),
+		Messages:  []Message{},
+	}
+
+	// Add user query
+	chat.Messages = append(chat.Messages, Message{
+		Role:      "user",
+		Content:   query,
+		Timestamp: time.Now(),
+	})
+
+	// Add assistant answer with rating
+	chat.Messages = append(chat.Messages, Message{
+		Role:      "assistant",
+		Content:   answer,
+		Timestamp: time.Now(),
+		Rating: &Rating{
+			Score:            rating,
+			Timestamp:        time.Now(),
+			Query:            query,
+			ContextUsed:      ragResult.ContextUsed,
+			ContextChunks:    ragResult.ContextsUsed,
+			Model:            config.Model,
+			VectorTopK:       config.VectorTopK,
+			VectorSimilarity: config.VectorSimilarity,
+		},
+	})
+
+	return storage.SaveChat(chat)
 }
