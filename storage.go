@@ -15,6 +15,18 @@ type Message struct {
 	Role      string    `json:"role"`
 	Content   string    `json:"content"`
 	Timestamp time.Time `json:"timestamp"`
+	Rating    *Rating   `json:"rating,omitempty"` // Optional rating for assistant messages
+}
+
+type Rating struct {
+	Score           int       `json:"score"`              // 1-5 star rating
+	Timestamp       time.Time `json:"timestamp"`
+	Query           string    `json:"query"`              // Original user query
+	ContextUsed     bool      `json:"context_used"`       // Was vector context used?
+	ContextChunks   int       `json:"context_chunks"`     // Number of chunks used
+	Model           string    `json:"model"`              // Model that generated the answer
+	VectorTopK      int       `json:"vector_top_k"`       // TopK setting used
+	VectorSimilarity float64  `json:"vector_similarity"` // Similarity threshold used
 }
 
 type Chat struct {

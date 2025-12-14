@@ -39,4 +39,5 @@ func init() {
 	// Add subcommands
 	rootCmd.AddCommand(importCmd)
 	rootCmd.AddCommand(queryCmd)
+	rootCmd.AddCommand(exportRatingsCmd)
 }

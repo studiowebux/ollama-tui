@@ -91,6 +91,10 @@ type model struct {
 
 	// Chunk detail view scroll
 	chunkDetailScroll int
+
+	// Rating system
+	pendingRating     bool // Waiting for user to rate the last message
+	pendingRatingIndex int  // Index of message being rated
 }
 
 type streamChunkMsg string
@@ -402,7 +406,7 @@ func (m model) renderChatView() string {
 		}
 	}
 
-	help := helpStyle.Render("esc: back | ctrl+j/k or pgup/pgdn: scroll | ctrl+n: new | ctrl+s: settings | ctrl+t: summarize | ctrl+b: vectorize | ctrl+v: vector info")
+	help := helpStyle.Render("esc: back | ctrl+j/k or pgup/pgdn: scroll | r: rate | ctrl+n: new | ctrl+s: settings | ctrl+t: summarize | ctrl+b: vectorize | ctrl+v: vector info")
 
 	status := ""
 	if m.vectorContextUsed {
@@ -612,16 +616,45 @@ func (m *model) handleChatViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	// Handle rating keys
+	if msg.String() == "r" && !m.streaming && !m.pendingRating {
+		// Find the last unrated assistant message
+		for i := len(m.messages) - 1; i >= 0; i-- {
+			if i < len(m.messageRoles) && m.messageRoles[i] == "assistant" {
+				if i < len(m.currentChat.Messages) && m.currentChat.Messages[i].Rating == nil {
+					m.pendingRating = true
+					m.pendingRatingIndex = i
+					m.updateViewport()
+					return m, nil
+				}
+			}
+		}
+		return m, nil
+	}
+
+	// Handle rating score keys (1-5)
+	if m.pendingRating && (msg.String() >= "1" && msg.String() <= "5") {
+		score := int(msg.String()[0] - '0')
+		return m, m.rateMessage(m.pendingRatingIndex, score)
+	}
+
+	// Cancel rating with Esc
+	if m.pendingRating && msg.Type == tea.KeyEsc {
+		m.pendingRating = false
+		m.updateViewport()
+		return m, nil
+	}
+
 	// Handle enter for sending messages
 	if msg.Type == tea.KeyEnter {
-		if m.streaming {
+		if m.streaming || m.pendingRating {
 			return m, nil
 		}
 		return m, m.sendMessage()
 	}
 
-	// Pass all other keys to textarea when not streaming
-	if !m.streaming {
+	// Pass all other keys to textarea when not streaming and not rating
+	if !m.streaming && !m.pendingRating {
 		var cmd tea.Cmd
 		m.textarea, cmd = m.textarea.Update(msg)
 		return m, cmd
@@ -826,7 +859,28 @@ func (m *model) updateViewport() {
 			content.WriteString(m.messages[i] + "\n\n")
 		} else {
 			content.WriteString(assistantStyle.Render("Assistant:") + "\n")
-			content.WriteString(renderMessageWithThinking(m.messages[i]) + "\n\n")
+			content.WriteString(renderMessageWithThinking(m.messages[i]) + "\n")
+
+			// Show rating for this message
+			if m.currentChat != nil && i < len(m.currentChat.Messages) {
+				msg := &m.currentChat.Messages[i]
+				if msg.Rating != nil {
+					// Show existing rating
+					stars := strings.Repeat("⭐", msg.Rating.Score) + strings.Repeat("☆", 5-msg.Rating.Score)
+					ratingText := helpStyle.Render(fmt.Sprintf("  [Rated: %s %d/5]", stars, msg.Rating.Score))
+					content.WriteString(ratingText + "\n")
+				} else if !m.streaming && m.messages[i] != "" {
+					// Show rating prompt for unrated messages
+					if m.pendingRating && m.pendingRatingIndex == i {
+						ratingPrompt := lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Render("  Rate this answer (1-5): ☆☆☆☆☆")
+						content.WriteString(ratingPrompt + "\n")
+					} else {
+						ratingHint := helpStyle.Render("  [Press 'r' to rate]")
+						content.WriteString(ratingHint + "\n")
+					}
+				}
+			}
+			content.WriteString("\n")
 		}
 	}
 
@@ -965,6 +1019,48 @@ type vectorizeStartMsg struct{}
 type vectorizeProgressMsg struct {
 	current int
 	total   int
+}
+
+func (m *model) rateMessage(messageIndex int, score int) tea.Cmd {
+	if m.currentChat == nil || messageIndex >= len(m.currentChat.Messages) {
+		return nil
+	}
+
+	msg := &m.currentChat.Messages[messageIndex]
+	if msg.Role != "assistant" {
+		return nil
+	}
+
+	// Find the corresponding user query
+	userQuery := ""
+	if messageIndex > 0 && m.currentChat.Messages[messageIndex-1].Role == "user" {
+		userQuery = m.currentChat.Messages[messageIndex-1].Content
+	}
+
+	// Create rating
+	msg.Rating = &Rating{
+		Score:           score,
+		Timestamp:       time.Now(),
+		Query:           userQuery,
+		ContextUsed:     m.vectorContextUsed,
+		ContextChunks:   len(m.lastVectorResults),
+		Model:           m.config.Model,
+		VectorTopK:      m.config.VectorTopK,
+		VectorSimilarity: m.config.VectorSimilarity,
+	}
+
+	// Save the chat
+	if err := m.storage.SaveChat(m.currentChat); err != nil {
+		return func() tea.Msg {
+			return errMsg{err: fmt.Errorf("failed to save rating: %v", err)}
+		}
+	}
+
+	// Clear rating state and update viewport
+	m.pendingRating = false
+	m.updateViewport()
+
+	return nil
 }
 
 func (m *model) vectorizeChat() tea.Cmd {
