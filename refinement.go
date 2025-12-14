@@ -220,7 +220,9 @@ Additional Context Found:
 %s
 
 Create an improved answer that addresses the weaknesses using the additional context.
-Maintain the good parts of the current answer and enhance it with the new information.`, query, currentAnswer, weaknessText, additionalContext)
+Maintain the good parts of the current answer and enhance it with the new information.
+
+IMPORTANT: If the original query specified constraints (word limits, format, etc.), your refined answer MUST still respect those constraints.`, query, currentAnswer, weaknessText, additionalContext)
 
 	messages := []ChatMessage{{Role: "user", Content: prompt}}
 	response, err := r.client.Chat(model, messages)

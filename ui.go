@@ -982,18 +982,42 @@ func (m *model) sendMessage() tea.Cmd {
 		}
 	}
 
-	chatMessages := make([]ChatMessage, 0, len(m.currentChat.Messages))
-	for _, msg := range m.currentChat.Messages {
+	// Build chat messages with proper context handling
+	chatMessages := make([]ChatMessage, 0, len(m.currentChat.Messages)+1)
+
+	// Add system instruction with context if available
+	if relevantContext != "" {
+		// Add instruction first
 		chatMessages = append(chatMessages, ChatMessage{
-			Role:    msg.Role,
-			Content: msg.Content,
+			Role: "system",
+			Content: `Answer questions using the provided context.
+
+CRITICAL: If user specifies a word limit (e.g. "10 words max"), your answer MUST be that length or shorter. Do not write long explanations when brevity is requested.
+
+Context:`,
+		})
+
+		// Add context as separate message
+		chatMessages = append(chatMessages, ChatMessage{
+			Role:    "system",
+			Content: relevantContext,
 		})
 	}
 
-	// Prepend context to the last user message if found
-	if relevantContext != "" {
-		lastIdx := len(chatMessages) - 1
-		chatMessages[lastIdx].Content = relevantContext + "\n---\n\n" + chatMessages[lastIdx].Content
+	// Add conversation history (skip the last user message we already have)
+	for i, msg := range m.currentChat.Messages {
+		if i == len(m.currentChat.Messages)-1 && msg.Role == "user" {
+			// Add final user message without context prepended
+			chatMessages = append(chatMessages, ChatMessage{
+				Role:    msg.Role,
+				Content: msg.Content,
+			})
+		} else {
+			chatMessages = append(chatMessages, ChatMessage{
+				Role:    msg.Role,
+				Content: msg.Content,
+			})
+		}
 	}
 
 	return m.streamResponse(chatMessages)

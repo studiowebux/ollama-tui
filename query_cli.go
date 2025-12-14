@@ -128,18 +128,52 @@ func runQueryCommand() {
 	var messages []ChatMessage
 
 	if ragResult.ContextUsed {
-		// Add system message with context
-		systemMsg := ragResult.Context
+		// Add system instruction BEFORE context
+		messages = append(messages, ChatMessage{
+			Role: "system",
+			Content: `You must answer questions directly and concisely using the provided context.
+
+CRITICAL RULES - MUST FOLLOW:
+1. If user says "X words max" or "X words" - YOUR ANSWER MUST BE EXACTLY THAT LENGTH OR SHORTER
+2. Answer ONLY the specific question - do not add extra information
+3. Do not write essays or long explanations
+4. Do not ignore word limits
+5. Be direct and brief
+
+EXAMPLE:
+Question: "who is X, 10 words max"
+Good answer: "X is an ancient entity that created existence."
+Bad answer: Long paragraph explaining everything about X
+
+Now use this context to answer the user's question:`,
+		})
+
+		// Add context as separate message
 		messages = append(messages, ChatMessage{
 			Role:    "system",
-			Content: systemMsg,
+			Content: ragResult.Context,
+		})
+	} else {
+		// No context available - add basic instruction
+		messages = append(messages, ChatMessage{
+			Role:    "system",
+			Content: "Answer the user's question directly and concisely. If they specify a word limit, you MUST follow it exactly. Do not write long explanations when brevity is requested.",
 		})
 	}
 
-	// Add user query
+	// Add user query with reinforced constraints
+	userPrompt := cmd.QueryPrompt
+
+	// If query contains word limit, make it VERY explicit
+	if strings.Contains(strings.ToLower(userPrompt), "words") &&
+	   (strings.Contains(strings.ToLower(userPrompt), "max") ||
+	    strings.Contains(strings.ToLower(userPrompt), "limit")) {
+		userPrompt = userPrompt + "\n\nIMPORTANT: Your answer must be brief and respect the word limit specified above. Count your words carefully."
+	}
+
 	messages = append(messages, ChatMessage{
 		Role:    "user",
-		Content: cmd.QueryPrompt,
+		Content: userPrompt,
 	})
 
 	// Generate initial response (non-streaming for CLI)
