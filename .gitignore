@@ -1,5 +1,10 @@
 # Binaries
+ollamatui
 ollama-tui
+
+# Local data directories (contains user data - DO NOT COMMIT)
+.ollamatui/
+.ollama-tui/
 
 # Go
 *.exe

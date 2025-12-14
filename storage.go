@@ -43,7 +43,7 @@ func NewStorage(pm *ProjectManager, projectID string) (*Storage, error) {
 		return nil, err
 	}
 
-	backupDir := filepath.Join(home, ".ollama-tui", "backups")
+	backupDir := filepath.Join(home, ".ollamatui", "backups")
 	if err := os.MkdirAll(backupDir, 0755); err != nil {
 		return nil, err
 	}
@@ -174,7 +174,7 @@ func (s *Storage) BackupChat(chat *Chat) error {
 		return err
 	}
 
-	backupDir := filepath.Join(home, ".ollama-tui", "backups")
+	backupDir := filepath.Join(home, ".ollamatui", "backups")
 	timestamp := time.Now().Format("20060102_150405")
 	filename := chat.ID + "_" + timestamp + ".json"
 	path := filepath.Join(backupDir, filename)
