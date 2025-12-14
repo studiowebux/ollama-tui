@@ -132,7 +132,7 @@ func runQueryCommand() {
 		Content: cmd.QueryPrompt,
 	})
 
-	// Generate response (non-streaming for CLI)
+	// Generate initial response (non-streaming for CLI)
 	if cmd.QueryVerbose {
 		fmt.Println("=== Generating Answer ===")
 	}
@@ -143,15 +143,61 @@ func runQueryCommand() {
 		os.Exit(1)
 	}
 
-	// Output the answer
-	if cmd.QueryVerbose {
-		fmt.Println("\n=== Answer ===")
+	// Perform refinement if enabled
+	finalAnswer := response
+	var refinementResult *RefinementResult
+
+	if config.EnableRefinement {
+		refinementEngine := NewRefinementEngine(client, ragEngine, config)
+
+		progressChan := make(chan string, 10)
+		done := make(chan bool)
+
+		if cmd.QueryVerbose {
+			fmt.Println("\n=== Refinement Process ===")
+			go func() {
+				for msg := range progressChan {
+					fmt.Printf("  %s\n", msg)
+				}
+				done <- true
+			}()
+		} else {
+			go func() {
+				for range progressChan {
+				}
+				done <- true
+			}()
+		}
+
+		refinementResult, err = refinementEngine.RefineAnswer(cmd.QueryPrompt, response, ragResult, cmd.QueryModel, progressChan)
+		close(progressChan)
+		<-done
+
+		if err != nil {
+			if cmd.QueryVerbose {
+				fmt.Printf("  Warning: Refinement failed: %v\n", err)
+			}
+		} else {
+			finalAnswer = refinementResult.FinalAnswer
+		}
 	}
-	fmt.Println(strings.TrimSpace(response))
+
+	// Output the final answer
+	if cmd.QueryVerbose {
+		fmt.Println("\n=== Final Answer ===")
+	}
+	fmt.Println(strings.TrimSpace(finalAnswer))
 
 	if cmd.QueryVerbose {
 		fmt.Println()
 		fmt.Printf("Context used: %d chunks\n", ragResult.ContextsUsed)
 		fmt.Printf("Total results found: %d\n", ragResult.ResultsCount)
+
+		if refinementResult != nil && refinementResult.WasRefined {
+			fmt.Println("\nRefinement Summary:")
+			fmt.Printf("  Initial quality: %.2f\n", refinementResult.InitialScore.OverallScore)
+			fmt.Printf("  Final quality: %.2f\n", refinementResult.FinalScore.OverallScore)
+			fmt.Printf("  Passes performed: %d\n", refinementResult.PassesPerformed)
+		}
 	}
 }

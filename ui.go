@@ -95,6 +95,12 @@ type model struct {
 	// Rating system
 	pendingRating     bool // Waiting for user to rate the last message
 	pendingRatingIndex int  // Index of message being rated
+
+	// Refinement system
+	refining          bool   // Currently refining an answer
+	refinementStatus  string // Current refinement status message
+	lastRAGResult     *RAGResult // Last RAG result for refinement
+	lastUserQuery     string     // Last user query for refinement
 }
 
 type streamChunkMsg string
@@ -235,6 +241,43 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.currentChat != nil && len(m.messages) > 0 {
 			assistantMsg := m.messages[len(m.messages)-1]
 			m.storage.AddMessage(m.currentChat, "assistant", assistantMsg)
+
+			// Trigger refinement if enabled
+			if m.config.EnableRefinement && m.lastRAGResult != nil {
+				return m, m.refineAnswer(m.lastUserQuery, assistantMsg)
+			}
+		}
+		return m, nil
+
+	case refinementStartMsg:
+		m.refining = true
+		m.refinementStatus = "Analyzing answer quality..."
+		return m, nil
+
+	case refinementStatusMsg:
+		m.refinementStatus = string(msg)
+		return m, nil
+
+	case refinementDoneMsg:
+		m.refining = false
+		m.refinementStatus = ""
+
+		if msg.err != nil {
+			m.err = msg.err
+			return m, nil
+		}
+
+		// Replace the last message with refined answer if it improved
+		if msg.result.WasRefined && len(m.messages) > 0 {
+			m.messages[len(m.messages)-1] = msg.result.FinalAnswer
+
+			// Update in storage
+			if m.currentChat != nil && len(m.currentChat.Messages) > 0 {
+				m.currentChat.Messages[len(m.currentChat.Messages)-1].Content = msg.result.FinalAnswer
+				m.storage.SaveChat(m.currentChat)
+			}
+
+			m.updateViewport()
 		}
 		return m, nil
 
@@ -421,6 +464,8 @@ func (m model) renderChatView() string {
 		}
 	} else if m.summarizing {
 		status += helpStyle.Render("Summarizing conversation...")
+	} else if m.refining {
+		status += lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render(fmt.Sprintf("Refining answer... %s", m.refinementStatus))
 	} else if m.streaming {
 		status += helpStyle.Render("Streaming...")
 	}
@@ -1021,6 +1066,13 @@ type vectorizeProgressMsg struct {
 	total   int
 }
 
+type refinementStartMsg struct{}
+type refinementStatusMsg string
+type refinementDoneMsg struct {
+	result *RefinementResult
+	err    error
+}
+
 func (m *model) rateMessage(messageIndex int, score int) tea.Cmd {
 	if m.currentChat == nil || messageIndex >= len(m.currentChat.Messages) {
 		return nil
@@ -1061,6 +1113,37 @@ func (m *model) rateMessage(messageIndex int, score int) tea.Cmd {
 	m.updateViewport()
 
 	return nil
+}
+
+func (m *model) refineAnswer(query, initialAnswer string) tea.Cmd {
+	if m.ragEngine == nil || m.lastRAGResult == nil {
+		return nil
+	}
+
+	return func() tea.Msg {
+		// Send start message
+		go func() {
+			m.viewport.SetContent(m.viewport.View())
+		}()
+
+		progressChan := make(chan string, 10)
+		defer close(progressChan)
+
+		// Start background goroutine to send status messages
+		go func() {
+			for msg := range progressChan {
+				// Send status updates to the UI
+				go func(status string) {
+					// This will be picked up by the Update function
+				}(msg)
+			}
+		}()
+
+		refinementEngine := NewRefinementEngine(m.client, m.ragEngine, m.config)
+		result, err := refinementEngine.RefineAnswer(query, initialAnswer, m.lastRAGResult, m.config.Model, progressChan)
+
+		return refinementDoneMsg{result: result, err: err}
+	}
 }
 
 func (m *model) vectorizeChat() tea.Cmd {
@@ -1574,6 +1657,8 @@ func (m *model) retrieveRelevantContext(query string) (string, error) {
 	m.lastVectorResults = result.Results
 	m.vectorContextUsed = result.ContextUsed
 	m.lastVectorDebug = result.DebugInfo
+	m.lastRAGResult = result // Store for refinement
+	m.lastUserQuery = query  // Store for refinement
 
 	return result.Context, nil
 }

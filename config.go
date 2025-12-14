@@ -21,6 +21,11 @@ type Config struct {
 	VectorIncludeRelated  bool    `json:"vector_include_related"`
 	VectorLightMode       bool    `json:"vector_light_mode"`       // Skip heavy extractions for slow systems
 	VectorFuzzyThreshold  int     `json:"vector_fuzzy_threshold"`  // 0=disabled, 1-3=max edit distance for fuzzy matching
+
+	// Iterative refinement settings
+	EnableRefinement           bool    `json:"enable_refinement"`             // Enable iterative refinement
+	MaxRefinementPasses        int     `json:"max_refinement_passes"`         // Max number of refinement iterations
+	RefinementQualityThreshold float64 `json:"refinement_quality_threshold"`  // Trigger refinement if quality < threshold
 }
 
 func configPath() (string, error) {
@@ -56,6 +61,11 @@ func LoadConfig() (*Config, error) {
 		VectorIncludeRelated:  false,
 		VectorLightMode:       false,
 		VectorFuzzyThreshold:  2, // Default: edit distance <= 2 for fuzzy matching
+
+		// Refinement defaults (prioritize quality)
+		EnableRefinement:           true,
+		MaxRefinementPasses:        2,
+		RefinementQualityThreshold: 0.6,
 	}
 
 	data, err := os.ReadFile(path)
