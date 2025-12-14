@@ -2017,6 +2017,11 @@ func (m model) renderDocumentImportView() string {
 				}
 			}
 
+			// Replace tabs and newlines in displayPath to prevent layout issues
+			displayPath = strings.ReplaceAll(displayPath, "\t", " ")
+			displayPath = strings.ReplaceAll(displayPath, "\n", " ")
+			displayPath = strings.ReplaceAll(displayPath, "\r", " ")
+
 			fileLine := fmt.Sprintf("%s %-50s %8s", cursor, displayPath, sizeStr)
 			if i == m.importCursor {
 				fileLine = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Render(fileLine)
