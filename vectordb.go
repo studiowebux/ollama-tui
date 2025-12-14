@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/agnivade/levenshtein"
 	"github.com/google/uuid"
 )
 
@@ -606,8 +607,33 @@ func (db *VectorDB) FindByTopic(topic string) []VectorChunk {
 	return results
 }
 
+// matchKeyword checks if keyword matches query word (exact or fuzzy)
+func matchKeyword(keyword, queryWord string, fuzzyThreshold int) bool {
+	keywordLower := strings.ToLower(keyword)
+
+	// Try exact matching first (faster)
+	if strings.Contains(keywordLower, queryWord) || strings.Contains(queryWord, keywordLower) {
+		return true
+	}
+
+	// If fuzzy matching is disabled, stop here
+	if fuzzyThreshold == 0 {
+		return false
+	}
+
+	// Only apply fuzzy matching to words longer than 3 characters
+	if len(queryWord) <= 3 || len(keywordLower) <= 3 {
+		return false
+	}
+
+	// Calculate edit distance
+	distance := levenshtein.ComputeDistance(keywordLower, queryWord)
+	return distance <= fuzzyThreshold
+}
+
 // SearchHybrid combines semantic similarity with keyword matching for better recall
-func (db *VectorDB) SearchHybrid(queryEmbedding []float64, queryText string, topK int) []SearchResult {
+// fuzzyThreshold: 0=disabled, 1-3=max edit distance for fuzzy matching
+func (db *VectorDB) SearchHybrid(queryEmbedding []float64, queryText string, topK int, fuzzyThreshold int) []SearchResult {
 	results := make([]SearchResult, 0, len(db.chunks))
 	queryLower := strings.ToLower(queryText)
 	queryWords := strings.Fields(queryLower)
@@ -626,9 +652,8 @@ func (db *VectorDB) SearchHybrid(queryEmbedding []float64, queryText string, top
 		// Check search keywords (fictional content)
 		if len(chunk.Metadata.SearchKeywords) > 0 {
 			for _, keyword := range chunk.Metadata.SearchKeywords {
-				keywordLower := strings.ToLower(keyword)
 				for _, queryWord := range queryWords {
-					if strings.Contains(keywordLower, queryWord) || strings.Contains(queryWord, keywordLower) {
+					if matchKeyword(keyword, queryWord, fuzzyThreshold) {
 						keywordBoost += 0.15
 					}
 				}
@@ -638,9 +663,8 @@ func (db *VectorDB) SearchHybrid(queryEmbedding []float64, queryText string, top
 		// Check character references
 		if len(chunk.Metadata.CharacterRefs) > 0 {
 			for _, char := range chunk.Metadata.CharacterRefs {
-				charLower := strings.ToLower(char)
 				for _, queryWord := range queryWords {
-					if strings.Contains(charLower, queryWord) || strings.Contains(queryWord, charLower) {
+					if matchKeyword(char, queryWord, fuzzyThreshold) {
 						keywordBoost += 0.20
 					}
 				}
@@ -650,9 +674,8 @@ func (db *VectorDB) SearchHybrid(queryEmbedding []float64, queryText string, top
 		// Check location references
 		if len(chunk.Metadata.LocationRefs) > 0 {
 			for _, loc := range chunk.Metadata.LocationRefs {
-				locLower := strings.ToLower(loc)
 				for _, queryWord := range queryWords {
-					if strings.Contains(locLower, queryWord) || strings.Contains(queryWord, locLower) {
+					if matchKeyword(loc, queryWord, fuzzyThreshold) {
 						keywordBoost += 0.15
 					}
 				}
@@ -662,9 +685,8 @@ func (db *VectorDB) SearchHybrid(queryEmbedding []float64, queryText string, top
 		// Check entities
 		if len(chunk.Metadata.Entities) > 0 {
 			for _, entity := range chunk.Metadata.Entities {
-				entityLower := strings.ToLower(entity)
 				for _, queryWord := range queryWords {
-					if strings.Contains(entityLower, queryWord) || strings.Contains(queryWord, entityLower) {
+					if matchKeyword(entity, queryWord, fuzzyThreshold) {
 						keywordBoost += 0.10
 					}
 				}
@@ -674,9 +696,8 @@ func (db *VectorDB) SearchHybrid(queryEmbedding []float64, queryText string, top
 		// Check fact keywords
 		if len(chunk.Metadata.FactKeywords) > 0 {
 			for _, keyword := range chunk.Metadata.FactKeywords {
-				keywordLower := strings.ToLower(keyword)
 				for _, queryWord := range queryWords {
-					if strings.Contains(keywordLower, queryWord) || strings.Contains(queryWord, keywordLower) {
+					if matchKeyword(keyword, queryWord, fuzzyThreshold) {
 						keywordBoost += 0.10
 					}
 				}
@@ -685,9 +706,8 @@ func (db *VectorDB) SearchHybrid(queryEmbedding []float64, queryText string, top
 
 		// Check entity key (strongest boost for exact entity lookups)
 		if chunk.Metadata.EntityKey != "" {
-			entityKeyLower := strings.ToLower(chunk.Metadata.EntityKey)
 			for _, queryWord := range queryWords {
-				if strings.Contains(entityKeyLower, queryWord) || strings.Contains(queryWord, entityKeyLower) {
+				if matchKeyword(chunk.Metadata.EntityKey, queryWord, fuzzyThreshold) {
 					keywordBoost += 0.25
 				}
 			}

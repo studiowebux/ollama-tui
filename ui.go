@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"time"
 
@@ -35,6 +34,7 @@ type model struct {
 	client            *OllamaClient
 	config            *Config
 	vectorDB          *VectorDB
+	ragEngine         *RAGEngine
 	projectManager    *ProjectManager
 	currentView       view
 	currentChat       *Chat
@@ -153,11 +153,14 @@ func initialModel(storage *Storage, client *OllamaClient, config *Config, vector
 	vp := viewport.New(80, 20)
 	vp.SetContent("")
 
+	ragEngine := NewRAGEngine(client, vectorDB, config)
+
 	return model{
 		storage:        storage,
 		client:         client,
 		config:         config,
 		vectorDB:       vectorDB,
+		ragEngine:      ragEngine,
 		projectManager: pm,
 		currentView:    chatListView,
 		textarea:      ta,
@@ -1466,180 +1469,17 @@ func (m *model) vectorizeConversation(messages []Message, progressChan chan<- te
 
 // retrieveRelevantContext searches vector DB for relevant past conversations
 func (m *model) retrieveRelevantContext(query string) (string, error) {
-	m.lastVectorResults = nil
-	m.vectorContextUsed = false
-	m.lastVectorDebug = ""
-
-	if !m.config.VectorEnabled {
-		m.lastVectorDebug = "[Vector DB disabled]"
-		return "", nil
+	result, err := m.ragEngine.RetrieveContext(query)
+	if err != nil {
+		return "", err
 	}
 
-	// Enhance query if explicitly enabled (disabled by default for speed)
-	var searchQueries []string
-	searchQueries = append(searchQueries, query)
+	// Update model state with results
+	m.lastVectorResults = result.Results
+	m.vectorContextUsed = result.ContextUsed
+	m.lastVectorDebug = result.DebugInfo
 
-	if m.config.VectorEnhanceQuery {
-		if enhancement, err := m.client.EnhanceQuery(m.config.Model, query); err == nil && enhancement != nil {
-			// Add canonical form
-			if enhancement.CanonicalForm != "" {
-				searchQueries = append(searchQueries, enhancement.CanonicalForm)
-			}
-			// Add enhanced queries (limit to 2 most relevant)
-			for i, eq := range enhancement.EnhancedQueries {
-				if i >= 2 {
-					break
-				}
-				searchQueries = append(searchQueries, eq)
-			}
-		}
-	}
-
-	// Search with all query variations and combine results
-	allResults := make(map[string]SearchResult)
-
-	for _, sq := range searchQueries {
-		embedding, err := m.client.GenerateEmbedding(m.config.VectorModel, sq)
-		if err != nil {
-			continue
-		}
-
-		// Use hybrid search for better keyword matching
-		results := m.vectorDB.SearchHybrid(embedding, sq, m.config.VectorTopK*2)
-
-		// Merge results, keeping highest similarity score for each chunk
-		for _, result := range results {
-			if existing, ok := allResults[result.Chunk.ID]; !ok || result.Similarity > existing.Similarity {
-				allResults[result.Chunk.ID] = result
-			}
-		}
-	}
-
-	// Convert map to slice and sort by similarity
-	results := make([]SearchResult, 0, len(allResults))
-	for _, result := range allResults {
-		results = append(results, result)
-	}
-	sort.Slice(results, func(i, j int) bool {
-		return results[i].Similarity > results[j].Similarity
-	})
-
-	// Limit to initial topK
-	if len(results) > m.config.VectorTopK*2 {
-		results = results[:m.config.VectorTopK*2]
-	}
-
-	// Optionally expand with related chunks
-	if m.config.VectorIncludeRelated && len(results) > 0 {
-		expanded := make(map[string]SearchResult)
-		for _, result := range results {
-			expanded[result.Chunk.ID] = result
-
-			// Add parent context
-			if result.Chunk.Metadata.ParentChunkID != "" {
-				parent := m.vectorDB.GetChunkByID(result.Chunk.Metadata.ParentChunkID)
-				if parent != nil {
-					expanded[parent.ID] = SearchResult{
-						Chunk:      *parent,
-						Similarity: result.Similarity * 0.9,
-					}
-				}
-			}
-
-			// Add related chunks
-			for _, relatedID := range result.Chunk.Metadata.RelatedChunkIDs {
-				related := m.vectorDB.GetChunkByID(relatedID)
-				if related != nil {
-					expanded[related.ID] = SearchResult{
-						Chunk:      *related,
-						Similarity: result.Similarity * 0.85,
-					}
-				}
-			}
-		}
-
-		// Convert back to slice and sort
-		results = make([]SearchResult, 0, len(expanded))
-		for _, result := range expanded {
-			results = append(results, result)
-		}
-		sort.Slice(results, func(i, j int) bool {
-			return results[i].Similarity > results[j].Similarity
-		})
-
-		// Limit to topK after expansion
-		if len(results) > m.config.VectorTopK {
-			results = results[:m.config.VectorTopK]
-		}
-	}
-
-	m.lastVectorResults = results
-
-	var debugBuilder strings.Builder
-	debugBuilder.WriteString(fmt.Sprintf("Query: %s\n", truncateString(query, 60)))
-	debugBuilder.WriteString(fmt.Sprintf("Found %d results from vector DB\n", len(results)))
-
-	if len(results) == 0 {
-		m.lastVectorDebug = debugBuilder.String() + "No results found."
-		return "", nil
-	}
-
-	var contextBuilder strings.Builder
-	contextBuilder.WriteString("Relevant context from past conversations:\n\n")
-	usedCount := 0
-
-	for i, result := range results {
-		debugBuilder.WriteString(fmt.Sprintf("  %d. Similarity=%.4f (threshold=%.2f) ",
-			i+1, result.Similarity, m.config.VectorSimilarity))
-
-		// Determine source and content based on chunk type
-		var question, answer string
-		if result.Chunk.Metadata.SourceDocument != "" {
-			// Document import chunk
-			question = truncateString(result.Chunk.Content, 60) // Summary/question
-			answer = truncateString(result.Chunk.CanonicalAnswer, 60) // Code/content
-			if result.Chunk.Metadata.SourceDocument != "" {
-				debugBuilder.WriteString(fmt.Sprintf("[%s] ", result.Chunk.Metadata.SourceDocument))
-			}
-		} else {
-			// Conversation chunk
-			question = truncateString(result.Chunk.Metadata.UserMessage, 60)
-			answer = truncateString(result.Chunk.Metadata.AssistantMessage, 60)
-		}
-
-		if result.Similarity < m.config.VectorSimilarity {
-			debugBuilder.WriteString("SKIPPED\n")
-			debugBuilder.WriteString(fmt.Sprintf("     Q: %s\n", question))
-			debugBuilder.WriteString(fmt.Sprintf("     A: %s\n", answer))
-			continue
-		}
-
-		debugBuilder.WriteString("USED\n")
-		debugBuilder.WriteString(fmt.Sprintf("     Q: %s\n", question))
-		debugBuilder.WriteString(fmt.Sprintf("     A: %s\n", answer))
-		usedCount++
-
-		// Build context based on chunk type
-		if result.Chunk.Metadata.SourceDocument != "" {
-			contextBuilder.WriteString(fmt.Sprintf("Q: %s\nA: %s\n\n",
-				result.Chunk.Content,
-				result.Chunk.CanonicalAnswer))
-		} else {
-			contextBuilder.WriteString(fmt.Sprintf("Q: %s\nA: %s\n\n",
-				result.Chunk.Metadata.UserMessage,
-				result.Chunk.Metadata.AssistantMessage))
-		}
-	}
-
-	debugBuilder.WriteString(fmt.Sprintf("\nTotal contexts injected: %d\n", usedCount))
-	m.lastVectorDebug = debugBuilder.String()
-
-	if usedCount > 0 {
-		m.vectorContextUsed = true
-		return contextBuilder.String(), nil
-	}
-
-	return "", nil
+	return result.Context, nil
 }
 
 func (m *model) handleVectorStatsViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {

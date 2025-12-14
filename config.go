@@ -19,7 +19,8 @@ type Config struct {
 	VectorExtractMetadata bool    `json:"vector_extract_metadata"`      // Extract metadata during vectorization
 	VectorEnhanceQuery    bool    `json:"vector_enhance_query"`         // Enhance queries at message-send time (slow)
 	VectorIncludeRelated  bool    `json:"vector_include_related"`
-	VectorLightMode       bool    `json:"vector_light_mode"` // Skip heavy extractions for slow systems
+	VectorLightMode       bool    `json:"vector_light_mode"`       // Skip heavy extractions for slow systems
+	VectorFuzzyThreshold  int     `json:"vector_fuzzy_threshold"`  // 0=disabled, 1-3=max edit distance for fuzzy matching
 }
 
 func configPath() (string, error) {
@@ -54,6 +55,7 @@ func LoadConfig() (*Config, error) {
 		VectorEnhanceQuery:    false, // Disabled by default for speed
 		VectorIncludeRelated:  false,
 		VectorLightMode:       false,
+		VectorFuzzyThreshold:  2, // Default: edit distance <= 2 for fuzzy matching
 	}
 
 	data, err := os.ReadFile(path)
