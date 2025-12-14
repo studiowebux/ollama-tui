@@ -1956,7 +1956,7 @@ func (m model) renderDocumentImportView() string {
 	if len(m.scannedFiles) == 0 {
 		content.WriteString(helpStyle.Render("No supported files found. Scanning for .md, .go, .ts, .js, .py, .rs files...") + "\n")
 	} else {
-		content.WriteString(helpStyle.Render(fmt.Sprintf("Found %d files:\n", len(m.scannedFiles))))
+		content.WriteString(helpStyle.Render(fmt.Sprintf("Found %d files:", len(m.scannedFiles))) + "\n")
 
 		// Calculate display window
 		maxVisible := 20
@@ -2022,9 +2022,9 @@ func (m model) renderDocumentImportView() string {
 			displayPath = strings.ReplaceAll(displayPath, "\n", " ")
 			displayPath = strings.ReplaceAll(displayPath, "\r", " ")
 
-			fileLine := fmt.Sprintf("%s %-50s %8s", cursor, displayPath, sizeStr)
+			fileLine := fmt.Sprintf("%-2s%-50s %8s", cursor, displayPath, sizeStr)
 			if i == m.importCursor {
-				fileLine = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Render(fileLine)
+				fileLine = "\033[38;5;205m" + fileLine + "\033[0m"
 			}
 			content.WriteString(fileLine + "\n")
 		}
@@ -2103,7 +2103,7 @@ func (m *model) importDocument(filePath string) tea.Cmd {
 
 		// Start import in goroutine
 		go func() {
-			m.importProgressChan <- fmt.Sprintf("Starting: %s", filepath.Base(filePath))
+			m.importProgressChan <- fmt.Sprintf("[1/1] %s", filepath.Base(filePath))
 			err := m.docImporter.ImportDocument(filePath, m.config.Model, m.config.VectorModel, m.importProgressChan)
 
 			if err != nil {
