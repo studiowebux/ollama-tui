@@ -35,6 +35,7 @@ type model struct {
 	config            *Config
 	vectorDB          *VectorDB
 	ragEngine         *RAGEngine
+	mlScorer          *MLScorer
 	projectManager    *ProjectManager
 	currentView       view
 	currentChat       *Chat
@@ -165,12 +166,16 @@ func initialModel(storage *Storage, client *OllamaClient, config *Config, vector
 
 	ragEngine := NewRAGEngine(client, vectorDB, config)
 
+	// Initialize ML scorer (silently fails if model not available)
+	mlScorer, _ := NewMLScorer("quality_model.onnx", "model_metadata.json")
+
 	return model{
 		storage:        storage,
 		client:         client,
 		config:         config,
 		vectorDB:       vectorDB,
 		ragEngine:      ragEngine,
+		mlScorer:       mlScorer,
 		projectManager: pm,
 		currentView:    chatListView,
 		textarea:      ta,
@@ -1139,7 +1144,7 @@ func (m *model) refineAnswer(query, initialAnswer string) tea.Cmd {
 			}
 		}()
 
-		refinementEngine := NewRefinementEngine(m.client, m.ragEngine, m.config)
+		refinementEngine := NewRefinementEngine(m.client, m.ragEngine, m.config, m.mlScorer)
 		result, err := refinementEngine.RefineAnswer(query, initialAnswer, m.lastRAGResult, m.config.Model, progressChan)
 
 		return refinementDoneMsg{result: result, err: err}

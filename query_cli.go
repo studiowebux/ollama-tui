@@ -25,6 +25,9 @@ func runQueryCommand() {
 		os.Exit(1)
 	}
 
+	// Initialize ML scorer (silently fails if model not available)
+	mlScorer, _ := NewMLScorer("quality_model.onnx", "model_metadata.json")
+
 	// Use config values if not specified
 	if cmd.QueryProject == "" {
 		cmd.QueryProject = config.CurrentProject
@@ -148,7 +151,7 @@ func runQueryCommand() {
 	var refinementResult *RefinementResult
 
 	if config.EnableRefinement {
-		refinementEngine := NewRefinementEngine(client, ragEngine, config)
+		refinementEngine := NewRefinementEngine(client, ragEngine, config, mlScorer)
 
 		progressChan := make(chan string, 10)
 		done := make(chan bool)

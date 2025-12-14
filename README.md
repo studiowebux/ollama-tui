@@ -61,3 +61,30 @@ Default endpoint: `http://localhost:11434`
 ## Chat Storage
 
 Chats saved in `~/.ollama-ui/chats/`
+
+## Machine Learning Quality Prediction
+
+The refinement system can optionally use a trained neural network for quality prediction instead of heuristics.
+
+### Using ML Model
+
+1. Collect rating data using the TUI (press 'r' to rate answers)
+2. Export ratings: `./ollamatui export-ratings -o ratings.jsonl`
+3. Train model: `cd training && python train_quality_model.py ratings.jsonl --model nn`
+4. Export to ONNX: `python export_onnx.py --model quality_model.pth`
+5. Copy `quality_model.onnx` and `model_metadata.json` to project root
+
+### Requirements
+
+macOS with ONNX Runtime installed:
+```bash
+brew install onnxruntime
+```
+
+For other platforms, update `onnxruntime.SetSharedLibraryPath()` in ml_scorer.go
+
+### Fallback Behavior
+
+If ONNX model not found, system automatically falls back to heuristic quality scorer. No configuration needed.
+
+See `training/README.md` for detailed ML pipeline documentation.

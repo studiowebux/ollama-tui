@@ -15,7 +15,7 @@ type QualityScore struct {
 }
 
 // CalculateQualityScore computes a heuristic quality score for an answer
-func CalculateQualityScore(query, answer string, ragResult *RAGResult) *QualityScore {
+func CalculateQualityScore(query, answer string, ragResult *RAGResult, config *Config) *QualityScore {
 	score := &QualityScore{
 		Details: make(map[string]float64),
 	}

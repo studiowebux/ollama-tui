@@ -10,14 +10,16 @@ type RefinementEngine struct {
 	client   *OllamaClient
 	ragEngine *RAGEngine
 	config   *Config
+	mlScorer *MLScorer
 }
 
 // NewRefinementEngine creates a new refinement engine
-func NewRefinementEngine(client *OllamaClient, ragEngine *RAGEngine, config *Config) *RefinementEngine {
+func NewRefinementEngine(client *OllamaClient, ragEngine *RAGEngine, config *Config, mlScorer *MLScorer) *RefinementEngine {
 	return &RefinementEngine{
 		client:   client,
 		ragEngine: ragEngine,
 		config:   config,
+		mlScorer: mlScorer,
 	}
 }
 
@@ -38,8 +40,17 @@ func (r *RefinementEngine) RefineAnswer(query, initialAnswer string, initialRAGR
 		RefinementSteps: make([]string, 0),
 	}
 
-	// Calculate initial quality score
-	result.InitialScore = CalculateQualityScore(query, initialAnswer, initialRAGResult)
+	// Calculate initial quality score (use ML if available, otherwise heuristic)
+	var err error
+	if r.mlScorer != nil && r.mlScorer.IsAvailable() {
+		result.InitialScore, err = r.mlScorer.ScoreAnswer(query, initialAnswer, initialRAGResult, r.config)
+		if err != nil {
+			// Fallback to heuristic on error
+			result.InitialScore = CalculateQualityScore(query, initialAnswer, initialRAGResult, r.config)
+		}
+	} else {
+		result.InitialScore = CalculateQualityScore(query, initialAnswer, initialRAGResult, r.config)
+	}
 	result.FinalScore = result.InitialScore
 
 	if progressChan != nil {
@@ -112,8 +123,16 @@ func (r *RefinementEngine) RefineAnswer(query, initialAnswer string, initialRAGR
 			break
 		}
 
-		// Calculate new quality score
-		newScore := CalculateQualityScore(query, refinedAnswer, secondaryRAGResult)
+		// Calculate new quality score (use ML if available)
+		var newScore *QualityScore
+		if r.mlScorer != nil && r.mlScorer.IsAvailable() {
+			newScore, err = r.mlScorer.ScoreAnswer(query, refinedAnswer, secondaryRAGResult, r.config)
+			if err != nil {
+				newScore = CalculateQualityScore(query, refinedAnswer, secondaryRAGResult, r.config)
+			}
+		} else {
+			newScore = CalculateQualityScore(query, refinedAnswer, secondaryRAGResult, r.config)
+		}
 
 		result.RefinementSteps = append(result.RefinementSteps, fmt.Sprintf("New quality score: %.2f (was %.2f)", newScore.OverallScore, currentScore.OverallScore))
 
