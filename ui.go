@@ -166,8 +166,17 @@ func initialModel(storage *Storage, client *OllamaClient, config *Config, vector
 
 	ragEngine := NewRAGEngine(client, vectorDB, config)
 
-	// Initialize ML scorer (silently fails if model not available)
-	mlScorer, _ := NewMLScorer("quality_model.onnx", "model_metadata.json")
+	// Initialize ML scorer if explicitly enabled in config
+	var mlScorer *MLScorer
+	if config.MLEnableScoring && config.MLModelPath != "" && config.MLMetadataPath != "" {
+		var err error
+		mlScorer, err = NewMLScorer(config.MLModelPath, config.MLMetadataPath, config.MLOnnxLibPath)
+		if err != nil {
+			// Log warning but continue with heuristic scoring
+			fmt.Fprintf(os.Stderr, "Warning: Failed to load ML model, using heuristic scoring: %v\n", err)
+			mlScorer = nil
+		}
+	}
 
 	return model{
 		storage:        storage,

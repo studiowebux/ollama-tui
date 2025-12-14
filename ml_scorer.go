@@ -27,36 +27,41 @@ type ModelMetadata struct {
 }
 
 // NewMLScorer creates a new ML-based quality scorer
-func NewMLScorer(modelPath, metadataPath string) (*MLScorer, error) {
-	scorer := &MLScorer{
-		isAvailable:  false,
-		fallbackMode: false,
+// Returns (nil, error) on failure - caller must check error and handle appropriately
+func NewMLScorer(modelPath, metadataPath, onnxLibPath string) (*MLScorer, error) {
+	// Validate paths
+	if modelPath == "" || metadataPath == "" {
+		return nil, fmt.Errorf("model path and metadata path are required")
 	}
 
 	// Check if files exist
 	if _, err := os.Stat(modelPath); os.IsNotExist(err) {
-		return scorer, nil // Return scorer with fallback mode
+		return nil, fmt.Errorf("model file not found: %s", modelPath)
 	}
 	if _, err := os.Stat(metadataPath); os.IsNotExist(err) {
-		return scorer, nil
+		return nil, fmt.Errorf("metadata file not found: %s", metadataPath)
 	}
 
 	// Load metadata
 	metadataBytes, err := os.ReadFile(metadataPath)
 	if err != nil {
-		return scorer, nil
+		return nil, fmt.Errorf("failed to read metadata: %w", err)
 	}
 
 	var metadata ModelMetadata
 	if err := json.Unmarshal(metadataBytes, &metadata); err != nil {
-		return scorer, nil
+		return nil, fmt.Errorf("failed to parse metadata JSON: %w", err)
 	}
-	scorer.metadata = &metadata
+
+	// Set ONNX library path (use provided or platform default)
+	if onnxLibPath != "" {
+		onnxruntime.SetSharedLibraryPath(onnxLibPath)
+	}
+	// If empty, onnxruntime uses platform defaults
 
 	// Initialize ONNX runtime
-	onnxruntime.SetSharedLibraryPath("/usr/local/lib/onnxruntime.dylib")
 	if err := onnxruntime.InitializeEnvironment(); err != nil {
-		return scorer, nil
+		return nil, fmt.Errorf("failed to initialize ONNX runtime (is onnxruntime installed?): %w", err)
 	}
 
 	// Create session
@@ -69,13 +74,16 @@ func NewMLScorer(modelPath, metadataPath string) (*MLScorer, error) {
 		nil,
 	)
 	if err != nil {
-		return scorer, nil
+		onnxruntime.DestroyEnvironment()
+		return nil, fmt.Errorf("failed to create ONNX session: %w", err)
 	}
 
-	scorer.session = session
-	scorer.isAvailable = true
-
-	return scorer, nil
+	return &MLScorer{
+		session:      session,
+		metadata:     &metadata,
+		isAvailable:  true,
+		fallbackMode: false,
+	}, nil
 }
 
 // Close releases ONNX resources
@@ -94,10 +102,10 @@ func (s *MLScorer) IsAvailable() bool {
 }
 
 // ScoreAnswer predicts quality score using ML model
+// Returns error if prediction fails - caller should handle fallback
 func (s *MLScorer) ScoreAnswer(query, answer string, ragResult *RAGResult, config *Config) (*QualityScore, error) {
-	// If ML not available, use heuristic fallback
 	if !s.isAvailable {
-		return CalculateQualityScore(query, answer, ragResult, config), nil
+		return nil, fmt.Errorf("ML scorer not initialized")
 	}
 
 	// Extract features (matching Python pipeline)
@@ -109,8 +117,7 @@ func (s *MLScorer) ScoreAnswer(query, answer string, ragResult *RAGResult, confi
 	// Run ONNX inference
 	score, err := s.predict(normalizedFeatures)
 	if err != nil {
-		// Fallback to heuristic on error
-		return CalculateQualityScore(query, answer, ragResult, config), nil
+		return nil, fmt.Errorf("prediction failed: %w", err)
 	}
 
 	// Build quality score result

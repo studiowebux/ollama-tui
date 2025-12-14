@@ -25,8 +25,15 @@ func runQueryCommand() {
 		os.Exit(1)
 	}
 
-	// Initialize ML scorer (silently fails if model not available)
-	mlScorer, _ := NewMLScorer("quality_model.onnx", "model_metadata.json")
+	// Initialize ML scorer if explicitly enabled in config
+	var mlScorer *MLScorer
+	if config.MLEnableScoring && config.MLModelPath != "" && config.MLMetadataPath != "" {
+		mlScorer, err = NewMLScorer(config.MLModelPath, config.MLMetadataPath, config.MLOnnxLibPath)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Failed to load ML model, using heuristic scoring: %v\n", err)
+			mlScorer = nil
+		}
+	}
 
 	// Use config values if not specified
 	if cmd.QueryProject == "" {

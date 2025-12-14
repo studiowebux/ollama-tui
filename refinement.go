@@ -40,16 +40,25 @@ func (r *RefinementEngine) RefineAnswer(query, initialAnswer string, initialRAGR
 		RefinementSteps: make([]string, 0),
 	}
 
-	// Calculate initial quality score (use ML if available, otherwise heuristic)
+	// Calculate initial quality score
 	var err error
-	if r.mlScorer != nil && r.mlScorer.IsAvailable() {
+	if r.mlScorer != nil {
 		result.InitialScore, err = r.mlScorer.ScoreAnswer(query, initialAnswer, initialRAGResult, r.config)
 		if err != nil {
-			// Fallback to heuristic on error
+			// ML scoring failed, fall back to heuristic
+			if progressChan != nil {
+				progressChan <- fmt.Sprintf("ML scoring failed (%v), using heuristic", err)
+			}
 			result.InitialScore = CalculateQualityScore(query, initialAnswer, initialRAGResult, r.config)
+		} else if progressChan != nil {
+			progressChan <- "Using ML-based quality scoring"
 		}
 	} else {
+		// No ML scorer, use heuristic
 		result.InitialScore = CalculateQualityScore(query, initialAnswer, initialRAGResult, r.config)
+		if progressChan != nil {
+			progressChan <- "Using heuristic quality scoring"
+		}
 	}
 	result.FinalScore = result.InitialScore
 
@@ -123,11 +132,12 @@ func (r *RefinementEngine) RefineAnswer(query, initialAnswer string, initialRAGR
 			break
 		}
 
-		// Calculate new quality score (use ML if available)
+		// Calculate new quality score
 		var newScore *QualityScore
-		if r.mlScorer != nil && r.mlScorer.IsAvailable() {
+		if r.mlScorer != nil {
 			newScore, err = r.mlScorer.ScoreAnswer(query, refinedAnswer, secondaryRAGResult, r.config)
 			if err != nil {
+				// ML scoring failed, fall back to heuristic
 				newScore = CalculateQualityScore(query, refinedAnswer, secondaryRAGResult, r.config)
 			}
 		} else {

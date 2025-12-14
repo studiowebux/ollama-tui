@@ -66,25 +66,46 @@ Chats saved in `~/.ollama-ui/chats/`
 
 The refinement system can optionally use a trained neural network for quality prediction instead of heuristics.
 
-### Using ML Model
+### Setup
 
-1. Collect rating data using the TUI (press 'r' to rate answers)
-2. Export ratings: `./ollamatui export-ratings -o ratings.jsonl`
-3. Train model: `cd training && python train_quality_model.py ratings.jsonl --model nn`
-4. Export to ONNX: `python export_onnx.py --model quality_model.pth`
-5. Copy `quality_model.onnx` and `model_metadata.json` to project root
+1. Install ONNX Runtime:
+   - macOS: `brew install onnxruntime`
+   - Linux: Download from https://github.com/microsoft/onnxruntime/releases
+   - Platform-specific library path will be auto-detected
 
-### Requirements
+2. Collect rating data using the TUI (press 'r' to rate answers, need 100+ samples)
 
-macOS with ONNX Runtime installed:
-```bash
-brew install onnxruntime
-```
+3. Export ratings:
+   ```bash
+   ./ollamatui export-ratings -o ratings.jsonl
+   ```
 
-For other platforms, update `onnxruntime.SetSharedLibraryPath()` in ml_scorer.go
+4. Train model:
+   ```bash
+   cd training
+   python train_quality_model.py ratings.jsonl --model nn --epochs 100
+   python export_onnx.py --model quality_model.pth
+   ```
 
-### Fallback Behavior
+5. Configure in `~/.ollamatui/config.json`:
+   ```json
+   {
+     "ml_enable_scoring": true,
+     "ml_model_path": "/absolute/path/to/quality_model.onnx",
+     "ml_metadata_path": "/absolute/path/to/model_metadata.json",
+     "ml_onnx_lib_path": ""
+   }
+   ```
 
-If ONNX model not found, system automatically falls back to heuristic quality scorer. No configuration needed.
+   Leave `ml_onnx_lib_path` empty for platform defaults.
+
+### Behavior
+
+- `ml_enable_scoring: false` (default) → Always uses heuristic scoring
+- `ml_enable_scoring: true` + paths configured → Uses ML if model loads successfully
+- If ML model fails to load → Warning logged, falls back to heuristic
+- If ML inference fails → Falls back to heuristic for that query
+
+No silent failures. All errors are logged to stderr.
 
 See `training/README.md` for detailed ML pipeline documentation.

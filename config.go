@@ -26,6 +26,12 @@ type Config struct {
 	EnableRefinement           bool    `json:"enable_refinement"`             // Enable iterative refinement
 	MaxRefinementPasses        int     `json:"max_refinement_passes"`         // Max number of refinement iterations
 	RefinementQualityThreshold float64 `json:"refinement_quality_threshold"`  // Trigger refinement if quality < threshold
+
+	// ML quality prediction settings
+	MLModelPath      string `json:"ml_model_path"`       // Path to ONNX model file (empty = use heuristic)
+	MLMetadataPath   string `json:"ml_metadata_path"`    // Path to model metadata JSON
+	MLOnnxLibPath    string `json:"ml_onnx_lib_path"`    // Path to ONNX runtime library (empty = platform default)
+	MLEnableScoring  bool   `json:"ml_enable_scoring"`   // Enable ML-based quality scoring (false = always use heuristic)
 }
 
 func configPath() (string, error) {
@@ -66,6 +72,12 @@ func LoadConfig() (*Config, error) {
 		EnableRefinement:           true,
 		MaxRefinementPasses:        2,
 		RefinementQualityThreshold: 0.6,
+
+		// ML defaults (disabled by default, no hardcoded paths)
+		MLModelPath:     "",    // Empty = use heuristic
+		MLMetadataPath:  "",    // Empty = use heuristic
+		MLOnnxLibPath:   "",    // Empty = platform default
+		MLEnableScoring: false, // Explicit opt-in required
 	}
 
 	data, err := os.ReadFile(path)
