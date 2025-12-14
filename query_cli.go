@@ -270,7 +270,7 @@ Now use this context to answer the user's question:`,
 				if err != nil {
 					fmt.Fprintf(os.Stderr, "Error saving rating: %v\n", err)
 				} else {
-					fmt.Printf("\n✓ Rating saved: %s (%d/5)\n", strings.Repeat("⭐", rating)+strings.Repeat("☆", 5-rating), rating)
+					fmt.Printf("\nRating saved: %d/5\n", rating)
 				}
 			}
 		}
