@@ -518,6 +518,26 @@ func (db *VectorDB) HasDocumentHash(hash string) bool {
 	return false
 }
 
+// RemoveChunksByDocumentHash removes all chunks associated with a document hash
+func (db *VectorDB) RemoveChunksByDocumentHash(hash string) int {
+	removed := 0
+	newChunks := make([]VectorChunk, 0, len(db.chunks))
+
+	for _, chunk := range db.chunks {
+		if chunk.Metadata.DocumentHash == hash {
+			removed++
+			// Delete the chunk file
+			chunkPath := filepath.Join(db.dataDir, chunk.ID+".json")
+			os.Remove(chunkPath)
+		} else {
+			newChunks = append(newChunks, chunk)
+		}
+	}
+
+	db.chunks = newChunks
+	return removed
+}
+
 // SearchWithContext expands results with related chunks
 func (db *VectorDB) SearchWithContext(queryEmbedding []float64, topK int, includeRelated bool) []SearchResult {
 	results := db.Search(queryEmbedding, topK)

@@ -63,6 +63,23 @@ func (di *DocumentImporter) ImportDocumentWithStrategy(filePath, chatModel, embe
 		LastModified: info.ModTime(),
 	}
 
+	// Track chunks before processing
+	chunksBefore := len(di.vectorDB.GetAllChunks())
+
 	// Use the specified strategy
-	return di.ProcessWithStrategy(doc, strategy, chatModel, embedModel, progressChan)
+	err = di.ProcessWithStrategy(doc, strategy, chatModel, embedModel, progressChan)
+
+	// If processing failed, rollback any chunks that were added
+	if err != nil {
+		chunksAfter := len(di.vectorDB.GetAllChunks())
+		if chunksAfter > chunksBefore {
+			// Remove chunks that were added during failed processing
+			di.vectorDB.RemoveChunksByDocumentHash(hashStr)
+			if progressChan != nil {
+				progressChan <- fmt.Sprintf("Rolled back %d chunks due to error", chunksAfter-chunksBefore)
+			}
+		}
+	}
+
+	return err
 }
