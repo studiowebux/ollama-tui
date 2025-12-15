@@ -27,6 +27,7 @@ const (
 	refineChunkView
 	refineDiffView
 	documentImportView
+	strategySelectionView
 )
 
 type model struct {
@@ -86,6 +87,9 @@ type model struct {
 	scannedFiles       []string
 	importCursor       int
 	importProgressChan chan string
+	selectedStrategy   string
+	strategyCursor     int
+	importAll          bool // Track if importing all or single file
 
 	// Vector stats view scroll
 	vectorStatsScroll int
@@ -235,6 +239,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleConfirmResetViewKeys(msg)
 		case documentImportView:
 			return m.handleDocumentImportViewKeys(msg)
+		case strategySelectionView:
+			return m.handleStrategySelectionViewKeys(msg)
 		}
 
 	case streamStartMsg:
@@ -444,6 +450,8 @@ func (m model) View() string {
 		return m.renderRefineDiffView()
 	case documentImportView:
 		return m.renderDocumentImportView()
+	case strategySelectionView:
+		return m.renderStrategySelectionView()
 	}
 	return ""
 }
@@ -2061,18 +2069,20 @@ func (m *model) handleDocumentImportViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd
 
 	case "enter":
 		if len(m.scannedFiles) > 0 && !m.importing {
-			m.importing = true
-			m.importProgress = []string{}
-			m.importProgressChan = make(chan string, 100)
-			return m, m.importDocument(m.scannedFiles[m.importCursor])
+			// Show strategy selection
+			m.importAll = false
+			m.strategyCursor = 0
+			m.currentView = strategySelectionView
+			return m, nil
 		}
 
 	case "a", "A":
 		if len(m.scannedFiles) > 0 && !m.importing {
-			m.importing = true
-			m.importProgress = []string{}
-			m.importProgressChan = make(chan string, 100)
-			return m, m.importAllDocuments()
+			// Show strategy selection
+			m.importAll = true
+			m.strategyCursor = 0
+			m.currentView = strategySelectionView
+			return m, nil
 		}
 	}
 
@@ -2162,6 +2172,175 @@ func (m *model) importAllDocuments() tea.Cmd {
 				m.importProgressChan <- fmt.Sprintf("[%d/%d] %s", i+1, totalFiles, filepath.Base(filePath))
 
 				err := m.docImporter.ImportDocument(filePath, m.config.Model, m.config.VectorModel, m.importProgressChan)
+				if err != nil {
+					if strings.Contains(err.Error(), "already imported") {
+						skipped++
+					} else {
+						failed++
+						m.importProgressChan <- fmt.Sprintf("  Error: %v", err)
+					}
+				} else {
+					imported++
+				}
+			}
+
+			chunksAfter := len(m.vectorDB.GetAllChunks())
+			newChunks := chunksAfter - chunksBefore
+
+			summary := fmt.Sprintf("\nComplete! Files: %d imported, %d skipped, %d failed | New chunks: %d",
+				imported, skipped, failed, newChunks)
+			m.importProgressChan <- summary
+
+			// Give UI time to display final message before closing
+			time.Sleep(100 * time.Millisecond)
+			close(m.importProgressChan)
+		}()
+
+		// Return first message to start the chain
+		return m.waitForImportProgress(m.importProgressChan)()
+	}
+}
+
+// Strategy Selection View
+func (m model) renderStrategySelectionView() string {
+	title := titleStyle.Render("Select Import Strategy")
+	help := helpStyle.Render("↑/↓: navigate | enter: select | esc: back")
+
+	strategies := []struct {
+		name        string
+		description string
+	}{
+		{"all", "All 16 strategies (comprehensive, slow)"},
+		{"basic", "Basic content only (fast)"},
+		{"entity_sheet", "Character/location sheets"},
+		{"who_what_why", "Structured Q&A extraction"},
+		{"keyword", "Keywords and phrases"},
+		{"sentence", "Sentence-level chunks"},
+		{"full_qa", "Full Q&A pairs"},
+		{"relationship_mapping", "Character relationships"},
+		{"timeline", "Timeline and chronology"},
+		{"conflict_plot", "Conflicts and plot points"},
+		{"rule_mechanic", "Rules and mechanics"},
+		{"project_planning", "Project planning"},
+		{"requirements", "Requirements and specs"},
+		{"task_breakdown", "Task breakdown"},
+		{"document_section", "Document sections (markdown)"},
+		{"code_snippet", "Code snippets"},
+		{"tags", "Tag extraction (#tag)"},
+		{"cross_references", "Document cross-references"},
+	}
+
+	var content strings.Builder
+	content.WriteString(title + "\n\n")
+
+	if m.importAll {
+		content.WriteString(helpStyle.Render(fmt.Sprintf("Importing all %d files", len(m.scannedFiles))) + "\n\n")
+	} else {
+		content.WriteString(helpStyle.Render(fmt.Sprintf("Importing: %s", filepath.Base(m.scannedFiles[m.importCursor]))) + "\n\n")
+	}
+
+	for i, strategy := range strategies {
+		cursor := "  "
+		if i == m.strategyCursor {
+			cursor = "> "
+		}
+
+		line := fmt.Sprintf("%s%-20s %s", cursor, strategy.name, strategy.description)
+		if i == m.strategyCursor {
+			line = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Render(line)
+		}
+		content.WriteString(line + "\n")
+	}
+
+	content.WriteString("\n" + help)
+	return content.String()
+}
+
+func (m *model) handleStrategySelectionViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	strategies := []string{
+		"all", "basic", "entity_sheet", "who_what_why", "keyword",
+		"sentence", "full_qa", "relationship_mapping", "timeline",
+		"conflict_plot", "rule_mechanic", "project_planning",
+		"requirements", "task_breakdown", "document_section",
+		"code_snippet", "tags", "cross_references",
+	}
+
+	switch msg.String() {
+	case "esc":
+		m.currentView = documentImportView
+		return m, nil
+
+	case "up", "k":
+		if m.strategyCursor > 0 {
+			m.strategyCursor--
+		}
+
+	case "down", "j":
+		if m.strategyCursor < len(strategies)-1 {
+			m.strategyCursor++
+		}
+
+	case "enter":
+		// Select strategy and start import
+		m.selectedStrategy = strategies[m.strategyCursor]
+		m.currentView = documentImportView
+		m.importing = true
+		m.importProgress = []string{}
+		m.importProgressChan = make(chan string, 100)
+
+		if m.importAll {
+			return m, m.importAllDocumentsWithStrategy(m.selectedStrategy)
+		} else {
+			return m, m.importDocumentWithStrategy(m.scannedFiles[m.importCursor], m.selectedStrategy)
+		}
+	}
+
+	return m, nil
+}
+
+func (m *model) importDocumentWithStrategy(filePath string, strategy string) tea.Cmd {
+	return func() tea.Msg {
+		if m.docImporter == nil {
+			m.docImporter = NewDocumentImporter(m.client, m.vectorDB, m.importPath)
+		}
+
+		// Start import in goroutine
+		go func() {
+			m.importProgressChan <- fmt.Sprintf("[1/1] %s (strategy: %s)", filepath.Base(filePath), strategy)
+			err := m.docImporter.ImportDocumentWithStrategy(filePath, m.config.Model, m.config.VectorModel, strategy, false, m.importProgressChan)
+
+			if err != nil {
+				m.importProgressChan <- fmt.Sprintf("Error: %v", err)
+			} else {
+				m.importProgressChan <- "Complete!"
+			}
+			close(m.importProgressChan)
+		}()
+
+		// Return first message to start the chain
+		return m.waitForImportProgress(m.importProgressChan)()
+	}
+}
+
+func (m *model) importAllDocumentsWithStrategy(strategy string) tea.Cmd {
+	return func() tea.Msg {
+		if m.docImporter == nil {
+			m.docImporter = NewDocumentImporter(m.client, m.vectorDB, m.importPath)
+		}
+
+		totalFiles := len(m.scannedFiles)
+
+		// Start import in goroutine
+		go func() {
+			chunksBefore := len(m.vectorDB.GetAllChunks())
+			imported := 0
+			skipped := 0
+			failed := 0
+
+			for i, filePath := range m.scannedFiles {
+				m.importProgressChan <- fmt.Sprintf("[%d/%d] %s (strategy: %s)", i+1, totalFiles, filepath.Base(filePath), strategy)
+
+				err := m.docImporter.ImportDocumentWithStrategy(filePath, m.config.Model, m.config.VectorModel, strategy, false, m.importProgressChan)
 				if err != nil {
 					if strings.Contains(err.Error(), "already imported") {
 						skipped++
