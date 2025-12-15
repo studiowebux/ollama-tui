@@ -109,11 +109,13 @@ type ChunkMetadata struct {
 	OriginalText  string `json:"original_text"`  // Full original message
 
 	// Document import fields
-	SourceDocument string `json:"source_document"` // File path for imported documents
-	DocumentType   string `json:"document_type"`   // markdown, go, typescript, etc
-	DocumentHash   string `json:"document_hash"`   // SHA256 hash of source document
-	CodeLanguage   string `json:"code_language"`   // Programming language for code snippets
-	CodeContext    string `json:"code_context"`    // Function/class name for code
+	SourceDocument   string   `json:"source_document"`   // File path for imported documents
+	DocumentType     string   `json:"document_type"`     // markdown, go, typescript, etc
+	DocumentHash     string   `json:"document_hash"`     // SHA256 hash of source document
+	CodeLanguage     string   `json:"code_language"`     // Programming language for code snippets
+	CodeContext      string   `json:"code_context"`      // Function/class name for code
+	DocumentTags     []string `json:"document_tags"`     // Extracted #tags from document
+	RelatedDocuments []string `json:"related_documents"` // Cross-referenced documents
 }
 
 // ContentStore manages deduplicated content

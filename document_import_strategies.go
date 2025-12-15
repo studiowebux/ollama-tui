@@ -87,6 +87,12 @@ func (di *DocumentImporter) ProcessWithStrategy(doc ImportedDocument, strategy s
 	case "task_breakdown":
 		return di.processTaskBreakdown(doc, chatModel, embedModel, progressChan)
 
+	// Relationship strategies
+	case "tags":
+		return di.processTags(doc, chatModel, embedModel, progressChan)
+	case "cross_references":
+		return di.processCrossReferences(doc, chatModel, embedModel, progressChan)
+
 	default:
 		return fmt.Errorf("unknown strategy: %s", strategy)
 	}
@@ -95,7 +101,7 @@ func (di *DocumentImporter) ProcessWithStrategy(doc ImportedDocument, strategy s
 // processAll applies multiple strategies for better retrieval
 func (di *DocumentImporter) processAll(doc ImportedDocument, chatModel, embedModel string, progressChan chan<- string) error {
 	if progressChan != nil {
-		progressChan <- "Applying ALL 14 strategies for comprehensive coverage"
+		progressChan <- "Applying ALL 16 strategies for comprehensive coverage"
 	}
 
 	// Apply ALL strategies - no auto-detection
@@ -118,6 +124,9 @@ func (di *DocumentImporter) processAll(doc ImportedDocument, chatModel, embedMod
 		// Document structure strategies
 		"document_section",
 		"code_snippet",
+		// Relationship strategies
+		"tags",
+		"cross_references",
 	}
 
 	if progressChan != nil {
