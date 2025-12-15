@@ -6,6 +6,33 @@ import (
 	"strings"
 )
 
+// extractStringValue converts interface{} to string, handling nested objects
+func extractStringValue(val interface{}) string {
+	if val == nil {
+		return ""
+	}
+	switch v := val.(type) {
+	case string:
+		return v
+	case map[string]interface{}:
+		// If it's a nested object, convert to JSON string
+		bytes, err := json.Marshal(v)
+		if err != nil {
+			return fmt.Sprintf("%v", v)
+		}
+		return string(bytes)
+	case []interface{}:
+		// If it's an array, join elements
+		parts := make([]string, 0, len(v))
+		for _, item := range v {
+			parts = append(parts, extractStringValue(item))
+		}
+		return strings.Join(parts, ", ")
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
 // ProcessWithStrategy processes a document using the specified strategy
 func (di *DocumentImporter) ProcessWithStrategy(doc ImportedDocument, strategy string, chatModel, embedModel string, progressChan chan<- string) error {
 	switch strategy {
@@ -228,12 +255,24 @@ If a field is not applicable, use an empty string "". Do not return an array.`, 
 			How   string `json:"how"`
 		}
 		if err2 := json.Unmarshal([]byte(jsonStr), &arr); err2 != nil {
-			return fmt.Errorf("failed to parse JSON as object or array: %v", err)
+			// If both fail, try parsing with flexible types (handle nested objects)
+			var flexible map[string]interface{}
+			if err3 := json.Unmarshal([]byte(jsonStr), &flexible); err3 != nil {
+				return fmt.Errorf("failed to parse JSON: %v", err)
+			}
+			// Convert all fields to strings
+			structured.Who = extractStringValue(flexible["who"])
+			structured.What = extractStringValue(flexible["what"])
+			structured.Why = extractStringValue(flexible["why"])
+			structured.When = extractStringValue(flexible["when"])
+			structured.Where = extractStringValue(flexible["where"])
+			structured.How = extractStringValue(flexible["how"])
+		} else {
+			if len(arr) == 0 {
+				return fmt.Errorf("LLM returned empty array")
+			}
+			structured = arr[0]
 		}
-		if len(arr) == 0 {
-			return fmt.Errorf("LLM returned empty array")
-		}
-		structured = arr[0]
 	}
 
 	// Create searchable content combining all fields
