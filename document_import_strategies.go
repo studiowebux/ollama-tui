@@ -258,7 +258,7 @@ If a field is not applicable, use an empty string "". Do not return an array.`, 
 			// If both fail, try parsing with flexible types (handle nested objects)
 			var flexible map[string]interface{}
 			if err3 := json.Unmarshal([]byte(jsonStr), &flexible); err3 != nil {
-				return fmt.Errorf("failed to parse JSON: %v", err)
+				return fmt.Errorf("all parsing attempts failed - object: %v, array: %v, flexible: %v", err, err2, err3)
 			}
 			// Convert all fields to strings
 			structured.Who = extractStringValue(flexible["who"])
