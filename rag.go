@@ -168,12 +168,39 @@ func (r *RAGEngine) RetrieveContext(query string) (*RAGResult, error) {
 	result.Results = results
 	result.ResultsCount = len(results)
 
+	// Count unique documents in all chunks
+	allDocuments := make(map[string]bool)
+	for _, chunk := range r.vectorDB.GetAllChunks() {
+		if chunk.Metadata.SourceDocument != "" {
+			allDocuments[chunk.Metadata.SourceDocument] = true
+		}
+	}
+
+	// Count unique documents in results
+	resultDocuments := make(map[string]int)
+	for _, searchResult := range results {
+		if searchResult.Chunk.Metadata.SourceDocument != "" {
+			resultDocuments[searchResult.Chunk.Metadata.SourceDocument]++
+		}
+	}
+
 	var debugBuilder strings.Builder
 	debugBuilder.WriteString(fmt.Sprintf("Query: %s\n", truncateString(query, 60)))
-	debugBuilder.WriteString(fmt.Sprintf("Found %d results from vector DB\n", len(results)))
+	debugBuilder.WriteString(fmt.Sprintf("Scanned: %d documents (%d total chunks)\n", len(allDocuments), len(r.vectorDB.GetAllChunks())))
+	debugBuilder.WriteString(fmt.Sprintf("Found: %d relevant chunks from %d documents\n", len(results), len(resultDocuments)))
+	debugBuilder.WriteString(fmt.Sprintf("Selected: top %d chunks for context\n", min(len(results), r.config.VectorTopK)))
+
+	if len(resultDocuments) > 0 {
+		debugBuilder.WriteString("Document distribution:\n")
+		for doc, count := range resultDocuments {
+			debugBuilder.WriteString(fmt.Sprintf("  - %s: %d chunks\n", doc, count))
+		}
+	}
+
 	if cappedTopK {
 		debugBuilder.WriteString(fmt.Sprintf("Warning: vector_top_k=%d is too high, capped at 20 chunks\n", r.config.VectorTopK))
 	}
+	debugBuilder.WriteString("\n")
 
 	if len(results) == 0 {
 		result.DebugInfo = debugBuilder.String() + "No results found."
