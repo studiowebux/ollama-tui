@@ -94,7 +94,46 @@ func LoadConfig() (*Config, error) {
 		return nil, err
 	}
 
+	// Validate and fix project reference
+	if err := config.ValidateAndFix(); err != nil {
+		return nil, err
+	}
+
 	return config, nil
+}
+
+// ValidateAndFix ensures config references valid projects
+func (c *Config) ValidateAndFix() error {
+	// Initialize project manager to check if project exists
+	pm, err := NewProjectManager()
+	if err != nil {
+		return err
+	}
+
+	// Check if current project exists
+	project := pm.GetProject(c.CurrentProject)
+	if project == nil {
+		// Project doesn't exist - find first valid project or create default
+		projects := pm.ListProjects()
+		if len(projects) > 0 {
+			// Use first available project
+			c.CurrentProject = projects[0].ID
+		} else {
+			// No projects exist - create default
+			defaultProj := &Project{
+				ID:   "default",
+				Name: "Default Project",
+			}
+			if err := pm.CreateProject(defaultProj); err != nil {
+				return err
+			}
+			c.CurrentProject = defaultProj.ID
+		}
+		// Save corrected config
+		c.Save()
+	}
+
+	return nil
 }
 
 func (c *Config) Save() error {
