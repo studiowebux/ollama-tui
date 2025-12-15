@@ -560,7 +560,11 @@ Return ONLY a JSON array:
 	}
 
 	if err := json.Unmarshal([]byte(jsonStr), &requirements); err != nil {
-		return err
+		// Try to fix common JSON issues
+		jsonStr = fixCommonJSONIssues(jsonStr)
+		if err2 := json.Unmarshal([]byte(jsonStr), &requirements); err2 != nil {
+			return fmt.Errorf("failed to parse requirements JSON: %v (original error: %v)", err2, err)
+		}
 	}
 
 	for _, req := range requirements {

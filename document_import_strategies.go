@@ -33,6 +33,20 @@ func extractStringValue(val interface{}) string {
 	}
 }
 
+// fixCommonJSONIssues attempts to fix common JSON formatting errors from LLMs
+func fixCommonJSONIssues(jsonStr string) string {
+	// Remove trailing commas before closing brackets/braces
+	jsonStr = strings.ReplaceAll(jsonStr, ",]", "]")
+	jsonStr = strings.ReplaceAll(jsonStr, ",}", "}")
+	jsonStr = strings.ReplaceAll(jsonStr, ", ]", "]")
+	jsonStr = strings.ReplaceAll(jsonStr, ", }", "}")
+
+	// Remove commas after colons with no value
+	jsonStr = strings.ReplaceAll(jsonStr, ":,", ": null,")
+
+	return jsonStr
+}
+
 // ProcessWithStrategy processes a document using the specified strategy
 func (di *DocumentImporter) ProcessWithStrategy(doc ImportedDocument, strategy string, chatModel, embedModel string, progressChan chan<- string) error {
 	switch strategy {
