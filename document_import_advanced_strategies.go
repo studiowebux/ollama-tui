@@ -259,11 +259,14 @@ Return ONLY a JSON array:
 				Timestamp:      doc.ImportedAt,
 			},
 		}
-		chunk.CanonicalQuestions = []string{
+		questions := []string{
 			fmt.Sprintf("What is the conflict involving %s?", strings.Join(conflict.Parties, " and ")),
 			"What conflicts exist?",
-			fmt.Sprintf("What are the stakes for %s?", conflict.Parties[0]),
 		}
+		if len(conflict.Parties) > 0 {
+			questions = append(questions, fmt.Sprintf("What are the stakes for %s?", conflict.Parties[0]))
+		}
+		chunk.CanonicalQuestions = questions
 		chunk.CanonicalAnswer = fmt.Sprintf("Problem: %s. Stakes: %s. Parties: %s. Status: %s. %s",
 			conflict.Problem, conflict.Stakes, strings.Join(conflict.Parties, ", "), conflict.Status, conflict.Outcome)
 

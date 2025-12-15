@@ -81,7 +81,7 @@ type model struct {
 	// Document import
 	docImporter        *DocumentImporter
 	importPath         string
-	importProgress     string
+	importProgress     []string
 	importing          bool
 	scannedFiles       []string
 	importCursor       int
@@ -351,7 +351,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case importProgressMsg:
-		m.importProgress = msg.message
+		m.importProgress = append(m.importProgress, msg.message)
+		// Keep only last 20 lines to avoid memory issues
+		if len(m.importProgress) > 20 {
+			m.importProgress = m.importProgress[len(m.importProgress)-20:]
+		}
 		// Continue listening for more progress (channel might still have messages)
 		if m.importProgressChan != nil {
 			return m, m.waitForImportProgress(m.importProgressChan)
@@ -1949,7 +1953,10 @@ func (m model) renderDocumentImportView() string {
 	content.WriteString(helpStyle.Render(fmt.Sprintf("Path: %s", m.importPath)) + "\n\n")
 
 	if m.importing {
-		content.WriteString(fmt.Sprintf("Importing... %s\n", m.importProgress))
+		content.WriteString("Importing...\n\n")
+		for _, line := range m.importProgress {
+			content.WriteString(fmt.Sprintf("  %s\n", line))
+		}
 		return content.String()
 	}
 
@@ -2055,6 +2062,7 @@ func (m *model) handleDocumentImportViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd
 	case "enter":
 		if len(m.scannedFiles) > 0 && !m.importing {
 			m.importing = true
+			m.importProgress = []string{}
 			m.importProgressChan = make(chan string, 100)
 			return m, m.importDocument(m.scannedFiles[m.importCursor])
 		}
@@ -2062,6 +2070,7 @@ func (m *model) handleDocumentImportViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd
 	case "a", "A":
 		if len(m.scannedFiles) > 0 && !m.importing {
 			m.importing = true
+			m.importProgress = []string{}
 			m.importProgressChan = make(chan string, 100)
 			return m, m.importAllDocuments()
 		}
