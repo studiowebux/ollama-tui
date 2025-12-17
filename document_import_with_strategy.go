@@ -44,12 +44,12 @@ func (di *DocumentImporter) ImportDocumentWithStrategy(filePath, chatModel, embe
 	hash := sha256.Sum256(content)
 	hashStr := hex.EncodeToString(hash[:])
 
-	// Check if this document hash already exists (unless force is enabled)
-	if !force && di.vectorDB.HasDocumentHash(hashStr) {
+	// Check if this document hash with this strategy already exists (unless force is enabled)
+	if !force && di.vectorDB.HasDocumentHashWithStrategy(hashStr, strategy) {
 		if progressChan != nil {
-			progressChan <- fmt.Sprintf("Skipped (already imported): %s", relPath)
+			progressChan <- fmt.Sprintf("Skipped (already imported with strategy %s): %s", strategy, relPath)
 		}
-		return fmt.Errorf("already imported")
+		return fmt.Errorf("already imported with strategy %s", strategy)
 	}
 
 	doc := ImportedDocument{

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 )
@@ -45,6 +46,12 @@ func (r *RAGEngine) RetrieveContext(query string) (*RAGResult, error) {
 	if !r.config.VectorEnabled {
 		result.DebugInfo = "[Vector DB disabled]"
 		return result, nil
+	}
+
+	// Detect if user specified a document name to filter by
+	filterDocument := r.detectDocumentFilter(query)
+	if filterDocument != "" {
+		result.DebugInfo = fmt.Sprintf("Filtering to document: %s\n", filterDocument)
 	}
 
 	// Enhance query if explicitly enabled
@@ -108,6 +115,17 @@ func (r *RAGEngine) RetrieveContext(query string) (*RAGResult, error) {
 		}
 	}
 	results = filtered
+
+	// Filter by document if specified
+	if filterDocument != "" {
+		documentFiltered := make([]SearchResult, 0)
+		for _, result := range results {
+			if r.matchesDocument(result.Chunk.Metadata.SourceDocument, filterDocument) {
+				documentFiltered = append(documentFiltered, result)
+			}
+		}
+		results = documentFiltered
+	}
 
 	// Limit to topK with sanity cap
 	// Enforce max 20 chunks regardless of config (more than 20 overwhelms LLMs)
@@ -283,4 +301,64 @@ func (r *RAGEngine) RetrieveContext(query string) (*RAGResult, error) {
 	}
 
 	return result, nil
+}
+
+// detectDocumentFilter extracts document name from query if user specifies one
+// Patterns: "in file.md", "from file.md", "file.md:", "according to file.md"
+func (r *RAGEngine) detectDocumentFilter(query string) string {
+	queryLower := strings.ToLower(query)
+	
+	// Pattern 1: "in <filename>"
+	inPattern := regexp.MustCompile(`\bin\s+([a-zA-Z0-9_\-./\s]+\.md)\b`)
+	if matches := inPattern.FindStringSubmatch(queryLower); len(matches) > 1 {
+		return strings.TrimSpace(matches[1])
+	}
+	
+	// Pattern 2: "from <filename>"
+	fromPattern := regexp.MustCompile(`\bfrom\s+([a-zA-Z0-9_\-./\s]+\.md)\b`)
+	if matches := fromPattern.FindStringSubmatch(queryLower); len(matches) > 1 {
+		return strings.TrimSpace(matches[1])
+	}
+	
+	// Pattern 3: "according to <filename>"
+	accordingPattern := regexp.MustCompile(`\baccording\s+to\s+([a-zA-Z0-9_\-./\s]+\.md)\b`)
+	if matches := accordingPattern.FindStringSubmatch(queryLower); len(matches) > 1 {
+		return strings.TrimSpace(matches[1])
+	}
+	
+	// Pattern 4: "<filename>:" at start or after comma
+	colonPattern := regexp.MustCompile(`(?:^|,\s*)([a-zA-Z0-9_\-./\s]+\.md):`)
+	if matches := colonPattern.FindStringSubmatch(queryLower); len(matches) > 1 {
+		return strings.TrimSpace(matches[1])
+	}
+	
+	return ""
+}
+
+// matchesDocument checks if source document matches the filter
+// Handles partial matches (e.g., "Part1.md" matches "docs/Part1.md")
+func (r *RAGEngine) matchesDocument(sourceDoc, filter string) bool {
+	if sourceDoc == "" {
+		return false
+	}
+	
+	sourceLower := strings.ToLower(sourceDoc)
+	filterLower := strings.ToLower(filter)
+	
+	// Exact match
+	if sourceLower == filterLower {
+		return true
+	}
+	
+	// Basename match (file.md matches path/to/file.md)
+	if strings.HasSuffix(sourceLower, "/"+filterLower) {
+		return true
+	}
+	
+	// Contains match (for "Part 1" matching "Part 1 - The Entity.md")
+	if strings.Contains(sourceLower, filterLower) {
+		return true
+	}
+	
+	return false
 }

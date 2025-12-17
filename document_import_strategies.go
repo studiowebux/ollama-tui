@@ -53,6 +53,9 @@ func (di *DocumentImporter) ProcessWithStrategy(doc ImportedDocument, strategy s
 	case "all":
 		return di.processAll(doc, chatModel, embedModel, progressChan)
 
+	case "basic":
+		return di.processBasic(doc, chatModel, embedModel, progressChan)
+
 	// Content strategies
 	case "entity_sheet":
 		return di.processEntitySheet(doc, chatModel, embedModel, progressChan)
@@ -143,6 +146,63 @@ func (di *DocumentImporter) processAll(doc ImportedDocument, chatModel, embedMod
 			}
 			// Continue with other strategies
 		}
+	}
+
+	return nil
+}
+
+// processBasic creates simple chunks without LLM processing (fast)
+func (di *DocumentImporter) processBasic(doc ImportedDocument, chatModel, embedModel string, progressChan chan<- string) error {
+	if progressChan != nil {
+		progressChan <- "Creating basic chunks (no LLM processing)"
+	}
+
+	// Simple chunking: split by paragraphs or fixed size
+	content := doc.Content
+	chunkSize := 500 // characters
+	overlap := 50     // overlap between chunks
+
+	chunks := make([]string, 0)
+	for i := 0; i < len(content); i += chunkSize - overlap {
+		end := i + chunkSize
+		if end > len(content) {
+			end = len(content)
+		}
+
+		chunkText := content[i:end]
+		if len(strings.TrimSpace(chunkText)) < 10 {
+			continue
+		}
+		chunks = append(chunks, chunkText)
+
+		if end >= len(content) {
+			break
+		}
+	}
+
+	for idx, chunkText := range chunks {
+		embedding, err := di.client.GenerateEmbedding(embedModel, chunkText)
+		if err != nil {
+			continue
+		}
+
+		chunk := VectorChunk{
+			ChatID:      "document_import",
+			Content:     chunkText,
+			ContentType: ContentTypeFact,
+			Strategy:    "basic",
+			Embedding:   embedding,
+			Metadata: ChunkMetadata{
+				OriginalText:   doc.Content,
+				SourceDocument: doc.RelativePath,
+				DocumentType:   string(doc.Type),
+				DocumentHash:   doc.Hash,
+				Timestamp:      doc.ImportedAt,
+				SentenceIndex:  idx,
+			},
+		}
+
+		di.vectorDB.AddChunk(chunk)
 	}
 
 	return nil
@@ -463,7 +523,29 @@ Return ONLY a JSON array:
 	}
 
 	if err := json.Unmarshal([]byte(jsonStr), &pairs); err != nil {
-		return err
+		// Try cleaning common JSON issues
+		jsonStr = fixCommonJSONIssues(jsonStr)
+		if err2 := json.Unmarshal([]byte(jsonStr), &pairs); err2 != nil {
+			// Try flexible parsing with interface{}
+			var flexiblePairs []map[string]interface{}
+			if err3 := json.Unmarshal([]byte(jsonStr), &flexiblePairs); err3 != nil {
+				return fmt.Errorf("all parsing attempts failed - strict: %v, cleaned: %v, flexible: %v", err, err2, err3)
+			}
+			// Convert to proper structure
+			pairs = make([]struct {
+				Question string `json:"question"`
+				Answer   string `json:"answer"`
+			}, 0, len(flexiblePairs))
+			for _, fp := range flexiblePairs {
+				pairs = append(pairs, struct {
+					Question string `json:"question"`
+					Answer   string `json:"answer"`
+				}{
+					Question: extractStringValue(fp["question"]),
+					Answer:   extractStringValue(fp["answer"]),
+				})
+			}
+		}
 	}
 
 	for _, pair := range pairs {

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -84,10 +85,12 @@ type model struct {
 	importPath         string
 	importProgress     []string
 	importing          bool
+	importCancelled    bool
 	scannedFiles       []string
 	importCursor       int
 	importProgressChan chan string
-	selectedStrategy   string
+	importCancelChan   chan bool
+	selectedStrategies map[string]bool
 	strategyCursor     int
 	importAll          bool // Track if importing all or single file
 
@@ -183,19 +186,20 @@ func initialModel(storage *Storage, client *OllamaClient, config *Config, vector
 	}
 
 	return model{
-		storage:        storage,
-		client:         client,
-		config:         config,
-		vectorDB:       vectorDB,
-		ragEngine:      ragEngine,
-		mlScorer:       mlScorer,
-		projectManager: pm,
-		currentView:    chatListView,
-		textarea:      ta,
-		viewport:      vp,
-		messages:      []string{},
-		endpointInput: endpointTa,
-		summaryInput:  summaryTa,
+		storage:            storage,
+		client:             client,
+		config:             config,
+		vectorDB:           vectorDB,
+		ragEngine:          ragEngine,
+		mlScorer:           mlScorer,
+		projectManager:     pm,
+		currentView:        chatListView,
+		textarea:          ta,
+		viewport:          vp,
+		messages:          []string{},
+		endpointInput:     endpointTa,
+		summaryInput:      summaryTa,
+		selectedStrategies: make(map[string]bool),
 	}
 }
 
@@ -212,8 +216,34 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = msg.Width
 		m.height = msg.Height
 		m.viewport.Width = msg.Width
-		m.viewport.Height = msg.Height - 8
-		m.textarea.SetWidth(msg.Width - 4)
+		m.textarea.SetWidth(msg.Width)
+
+		// Calculate viewport height properly
+		// Title: 1 line
+		// Blank line: 1 line
+		// Viewport: variable
+		// Blank line: 1 line
+		// Textarea: 3 lines
+		// Status: 0-1 lines (assume 1)
+		// Help: 1-3 lines depending on wrapping (assume 2 for width < 150, else 1)
+		usedHeight := 1 + 1 + 1 + 3 + 1 // title + blank + blank + textarea + status
+
+		// Help text wrapping estimation
+		helpTextLength := 150 // approximate length of help text
+		if msg.Width > 0 {
+			helpLines := (helpTextLength / msg.Width) + 1
+			if helpLines > 3 {
+				helpLines = 3 // cap at 3 lines
+			}
+			usedHeight += helpLines
+		} else {
+			usedHeight += 2 // default to 2 lines for help
+		}
+
+		m.viewport.Height = msg.Height - usedHeight
+		if m.viewport.Height < 5 {
+			m.viewport.Height = 5 // Absolute minimum
+		}
 
 	case tea.KeyMsg:
 		switch m.currentView {
@@ -242,6 +272,17 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case strategySelectionView:
 			return m.handleStrategySelectionViewKeys(msg)
 		}
+
+	case tea.MouseMsg:
+		// Handle mouse wheel scrolling in chat view
+		if m.currentView == chatView {
+			if msg.Type == tea.MouseWheelUp {
+				m.viewport.LineUp(3)
+			} else if msg.Type == tea.MouseWheelDown {
+				m.viewport.LineDown(3)
+			}
+		}
+		// Don't return - let it fall through to viewport.Update
 
 	case streamStartMsg:
 		m.streaming = true
@@ -370,7 +411,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case importCompleteMsg:
 		m.importing = false
+		m.importCancelled = false
 		m.importProgressChan = nil
+		m.importCancelChan = nil
 		// Keep the last progress message visible
 		return m, nil
 
@@ -457,6 +500,7 @@ func (m model) View() string {
 }
 
 func (m model) renderChatView() string {
+	// Build title
 	title := titleStyle.Render("Ollama Chat")
 	if m.currentChat != nil {
 		tokenCount := m.client.EstimateTokenCount(m.currentChat.Messages)
@@ -475,14 +519,18 @@ func (m model) renderChatView() string {
 		}
 	}
 
-	help := helpStyle.Render("esc: back | ctrl+j/k or pgup/pgdn: scroll | r: rate | ctrl+n: new | ctrl+s: settings | ctrl+t: summarize | ctrl+b: vectorize | ctrl+v: vector info")
+	// Build help text
+	help := helpStyle.Render("esc: back | ctrl+j/k or pgup/pgdn: scroll | ctrl+r: rate | ctrl+n: new | ctrl+s: settings | ctrl+t: summarize | ctrl+b: vectorize | ctrl+v: vector info")
 
+	// Build status
 	status := ""
 	if m.vectorContextUsed {
 		vectorIndicator := lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Render("Vector context used")
 		status = vectorIndicator + " "
 	}
-	if m.vectorizing {
+	if m.pendingRating {
+		status += lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true).Render("RATING MODE: Press 1-5 to rate | ESC to cancel")
+	} else if m.vectorizing {
 		if m.vectorProgress != "" {
 			status += helpStyle.Render(fmt.Sprintf("Vectorizing conversation... %s", m.vectorProgress))
 		} else {
@@ -499,16 +547,21 @@ func (m model) renderChatView() string {
 		status = errorStyle.Render(fmt.Sprintf("Error: %v", m.err))
 	}
 
-	var content strings.Builder
-	content.WriteString(title + "\n\n")
-	content.WriteString(m.viewport.View() + "\n\n")
-	content.WriteString(m.textarea.View() + "\n")
-	if status != "" {
-		content.WriteString(status + "\n")
+	// Use lipgloss to properly layout components
+	sections := []string{
+		title,
+		"", // blank line
+		m.viewport.View(),
+		"", // blank line
+		m.textarea.View(),
 	}
-	content.WriteString(help)
 
-	return content.String()
+	if status != "" {
+		sections = append(sections, status)
+	}
+	sections = append(sections, help)
+
+	return lipgloss.JoinVertical(lipgloss.Left, sections...)
 }
 
 func (m model) renderChatListView() string {
@@ -687,18 +740,26 @@ func (m *model) handleChatViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
-	// Handle rating keys
-	if msg.String() == "r" && !m.streaming && !m.pendingRating {
-		// Find the last unrated assistant message
-		for i := len(m.messages) - 1; i >= 0; i-- {
-			if i < len(m.messageRoles) && m.messageRoles[i] == "assistant" {
-				if i < len(m.currentChat.Messages) && m.currentChat.Messages[i].Rating == nil {
-					m.pendingRating = true
-					m.pendingRatingIndex = i
-					m.updateViewport()
-					return m, nil
-				}
+	// Handle rating with Ctrl+R
+	if msg.Type == tea.KeyCtrlR && !m.streaming && !m.pendingRating {
+		// Find the last assistant message in currentChat.Messages (allow re-rating)
+		if m.currentChat == nil {
+			m.err = fmt.Errorf("no active chat")
+			return m, nil
+		}
+
+		found := false
+		for i := len(m.currentChat.Messages) - 1; i >= 0; i-- {
+			if m.currentChat.Messages[i].Role == "assistant" {
+				m.pendingRating = true
+				m.pendingRatingIndex = i
+				m.updateViewport()
+				found = true
+				break
 			}
+		}
+		if !found {
+			m.err = fmt.Errorf("no assistant messages to rate")
 		}
 		return m, nil
 	}
@@ -919,44 +980,63 @@ func (m *model) handleSettingsViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m *model) updateViewport() {
 	var content strings.Builder
 
-	for i := 0; i < len(m.messages); i++ {
-		role := "user"
-		if i < len(m.messageRoles) {
-			role = m.messageRoles[i]
-		}
+	// Build display from m.currentChat.Messages (source of truth)
+	// m.messages is kept in sync but may have an extra empty streaming message
+	if m.currentChat != nil {
+		for i := 0; i < len(m.currentChat.Messages); i++ {
+			msg := &m.currentChat.Messages[i]
 
-		if role == "user" {
-			content.WriteString(userStyle.Render("You:") + "\n")
-			content.WriteString(m.messages[i] + "\n\n")
-		} else {
-			content.WriteString(assistantStyle.Render("Assistant:") + "\n")
-			content.WriteString(renderMessageWithThinking(m.messages[i]) + "\n")
+			if msg.Role == "user" {
+				content.WriteString(userStyle.Render("You:") + "\n")
+				content.WriteString(msg.Content + "\n\n")
+			} else {
+				content.WriteString(assistantStyle.Render("Assistant:") + "\n")
+				content.WriteString(renderMessageWithThinking(msg.Content) + "\n")
 
-			// Show rating for this message
-			if m.currentChat != nil && i < len(m.currentChat.Messages) {
-				msg := &m.currentChat.Messages[i]
+				// Show rating for assistant messages
 				if msg.Rating != nil {
-					// Show existing rating
-					stars := strings.Repeat("⭐", msg.Rating.Score) + strings.Repeat("☆", 5-msg.Rating.Score)
-					ratingText := helpStyle.Render(fmt.Sprintf("  [Rated: %s %d/5]", stars, msg.Rating.Score))
+					// Show existing rating with more visible styling
+					ratingText := lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Render(fmt.Sprintf("  [Rated: %d/5]", msg.Rating.Score))
 					content.WriteString(ratingText + "\n")
-				} else if !m.streaming && m.messages[i] != "" {
+				} else if msg.Content != "" {
 					// Show rating prompt for unrated messages
 					if m.pendingRating && m.pendingRatingIndex == i {
-						ratingPrompt := lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Render("  Rate this answer (1-5): ☆☆☆☆☆")
+						ratingPrompt := lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Bold(true).Render("  RATING MODE: Press 1-5 to rate | ESC to cancel")
 						content.WriteString(ratingPrompt + "\n")
-					} else {
-						ratingHint := helpStyle.Render("  [Press 'r' to rate]")
+					} else if !m.streaming {
+						// Only show hint when not streaming
+						ratingHint := helpStyle.Render("  [Press Ctrl+R to rate]")
 						content.WriteString(ratingHint + "\n")
 					}
 				}
+				content.WriteString("\n")
 			}
+		}
+
+		// If streaming, show the current incomplete assistant message
+		if m.streaming && len(m.messages) > len(m.currentChat.Messages) {
+			content.WriteString(assistantStyle.Render("Assistant:") + "\n")
+			streamingMsg := m.messages[len(m.messages)-1]
+			content.WriteString(renderMessageWithThinking(streamingMsg) + "\n")
 			content.WriteString("\n")
 		}
+
+		// Add padding at bottom to ensure last lines are visible
+		// Use half the viewport height to allow scrolling bottom content into view
+		// without excessive blank space
+		paddingLines := m.viewport.Height / 2
+		if paddingLines < 3 {
+			paddingLines = 3
+		}
+		content.WriteString(strings.Repeat("\n", paddingLines))
 	}
 
 	m.viewport.SetContent(content.String())
-	m.viewport.GotoBottom()
+	// Only auto-scroll to bottom when streaming or if already at bottom
+	// This allows users to scroll up without being forced back down
+	if m.streaming {
+		m.viewport.GotoBottom()
+	}
 }
 
 func (m *model) sendMessage() tea.Cmd {
@@ -986,53 +1066,70 @@ func (m *model) sendMessage() tea.Cmd {
 	m.streaming = true
 	m.updateViewport()
 
-	// Retrieve relevant context from vector DB
-	relevantContext, err := m.retrieveRelevantContext(userMsg)
-	if err != nil {
-		return func() tea.Msg {
+	// Move context retrieval and message building to async function
+	return func() tea.Msg {
+		// Retrieve relevant context from vector DB
+		relevantContext, err := m.retrieveRelevantContext(userMsg)
+		if err != nil {
 			return errMsg{err: fmt.Errorf("context retrieval failed: %w", err)}
 		}
-	}
 
-	// Build chat messages with proper context handling
-	chatMessages := make([]ChatMessage, 0, len(m.currentChat.Messages)+1)
+		// Build chat messages with proper context handling
+		chatMessages := make([]ChatMessage, 0, len(m.currentChat.Messages)+1)
 
-	// Add system instruction with context if available
-	if relevantContext != "" {
-		// Add instruction first
-		chatMessages = append(chatMessages, ChatMessage{
-			Role: "system",
-			Content: `Answer questions using the provided context.
+		// Add system instruction with context if available
+		if relevantContext != "" {
+			// Add instruction first
+			chatMessages = append(chatMessages, ChatMessage{
+				Role: "system",
+				Content: `Answer questions using the provided context.
 
 CRITICAL: If user specifies a word limit (e.g. "10 words max"), your answer MUST be that length or shorter. Do not write long explanations when brevity is requested.
 
 Context:`,
-		})
-
-		// Add context as separate message
-		chatMessages = append(chatMessages, ChatMessage{
-			Role:    "system",
-			Content: relevantContext,
-		})
-	}
-
-	// Add conversation history (skip the last user message we already have)
-	for i, msg := range m.currentChat.Messages {
-		if i == len(m.currentChat.Messages)-1 && msg.Role == "user" {
-			// Add final user message without context prepended
-			chatMessages = append(chatMessages, ChatMessage{
-				Role:    msg.Role,
-				Content: msg.Content,
 			})
-		} else {
+
+			// Add context as separate message
 			chatMessages = append(chatMessages, ChatMessage{
-				Role:    msg.Role,
-				Content: msg.Content,
+				Role:    "system",
+				Content: relevantContext,
 			})
 		}
-	}
 
-	return m.streamResponse(chatMessages)
+		// Add conversation history (skip the last user message we already have)
+		for i, msg := range m.currentChat.Messages {
+			if i == len(m.currentChat.Messages)-1 && msg.Role == "user" {
+				// Add final user message without context prepended
+				chatMessages = append(chatMessages, ChatMessage{
+					Role:    msg.Role,
+					Content: msg.Content,
+				})
+			} else {
+				chatMessages = append(chatMessages, ChatMessage{
+					Role:    msg.Role,
+					Content: msg.Content,
+				})
+			}
+		}
+
+		// Return streamStartMsg directly to begin streaming
+		chunkChan := make(chan string, 100)
+		errChan := make(chan error, 1)
+
+		go func() {
+			err := m.client.StreamChat(m.config.Model, chatMessages, func(chunk string) error {
+				chunkChan <- chunk
+				return nil
+			})
+			close(chunkChan)
+			if err != nil {
+				errChan <- err
+			}
+			close(errChan)
+		}()
+
+		return streamStartMsg{chunkChan: chunkChan, errChan: errChan}
+	}
 }
 
 func (m model) streamResponse(messages []ChatMessage) tea.Cmd {
@@ -1153,16 +1250,23 @@ func (m *model) rateMessage(messageIndex int, score int) tea.Cmd {
 
 	// Save the chat
 	if err := m.storage.SaveChat(m.currentChat); err != nil {
-		return func() tea.Msg {
-			return errMsg{err: fmt.Errorf("failed to save rating: %v", err)}
-		}
+		m.err = fmt.Errorf("failed to save rating: %v", err)
+		m.pendingRating = false
+		m.updateViewport()
+		return nil
 	}
 
 	// Clear rating state and update viewport
 	m.pendingRating = false
+	m.err = nil // Clear any previous errors
 	m.updateViewport()
+	// Go to bottom to show the newly added rating
+	m.viewport.GotoBottom()
 
-	return nil
+	// Return a no-op command to trigger re-render
+	return func() tea.Msg {
+		return nil
+	}
 }
 
 func (m *model) refineAnswer(query, initialAnswer string) tea.Cmd {
@@ -1954,17 +2058,37 @@ func (m *model) resetAllData() tea.Msg {
 // Document Import View
 func (m model) renderDocumentImportView() string {
 	title := titleStyle.Render("Document Import - Build Knowledge Base")
-	help := helpStyle.Render("↑/↓: navigate | enter: import | a: import all | esc: back")
+	var help string
+	if m.importing {
+		help = helpStyle.Render("c or esc: cancel import")
+	} else {
+		help = helpStyle.Render("↑/↓: navigate | enter: import | a: import all | esc: back")
+	}
 
 	var content strings.Builder
 	content.WriteString(title + "\n\n")
 	content.WriteString(helpStyle.Render(fmt.Sprintf("Path: %s", m.importPath)) + "\n\n")
 
 	if m.importing {
-		content.WriteString("Importing...\n\n")
+		if m.importCancelled {
+			content.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Render("Cancelling...") + "\n\n")
+		} else {
+			content.WriteString("Importing...\n\n")
+		}
 		for _, line := range m.importProgress {
 			content.WriteString(fmt.Sprintf("  %s\n", line))
 		}
+		content.WriteString("\n" + help)
+		return content.String()
+	}
+
+	// Show import results if available (after import completes)
+	if len(m.importProgress) > 0 {
+		content.WriteString("Import Complete\n\n")
+		for _, line := range m.importProgress {
+			content.WriteString(fmt.Sprintf("  %s\n", line))
+		}
+		content.WriteString("\n" + helpStyle.Render("esc: close"))
 		return content.String()
 	}
 
@@ -2054,16 +2178,37 @@ func (m model) renderDocumentImportView() string {
 func (m *model) handleDocumentImportViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
 	case "esc", "q":
+		if m.importing {
+			// Cancel import
+			m.importCancelled = true
+			if m.importCancelChan != nil {
+				m.importCancelChan <- true
+			}
+			return m, nil
+		}
+		// Clear import progress when closing results
+		if len(m.importProgress) > 0 {
+			m.importProgress = []string{}
+		}
 		m.currentView = chatListView
 		return m, m.loadChats
 
+	case "c", "C":
+		if m.importing {
+			// Cancel import
+			m.importCancelled = true
+			if m.importCancelChan != nil {
+				m.importCancelChan <- true
+			}
+		}
+
 	case "up", "k":
-		if m.importCursor > 0 {
+		if !m.importing && m.importCursor > 0 {
 			m.importCursor--
 		}
 
 	case "down", "j":
-		if m.importCursor < len(m.scannedFiles)-1 {
+		if !m.importing && m.importCursor < len(m.scannedFiles)-1 {
 			m.importCursor++
 		}
 
@@ -2203,8 +2348,8 @@ func (m *model) importAllDocuments() tea.Cmd {
 
 // Strategy Selection View
 func (m model) renderStrategySelectionView() string {
-	title := titleStyle.Render("Select Import Strategy")
-	help := helpStyle.Render("↑/↓: navigate | enter: select | esc: back")
+	title := titleStyle.Render("Select Import Strategies")
+	help := helpStyle.Render("↑/↓: navigate | space: toggle | enter: confirm | esc: back")
 
 	strategies := []struct {
 		name        string
@@ -2239,13 +2384,26 @@ func (m model) renderStrategySelectionView() string {
 		content.WriteString(helpStyle.Render(fmt.Sprintf("Importing: %s", filepath.Base(m.scannedFiles[m.importCursor]))) + "\n\n")
 	}
 
+	selectedCount := len(m.selectedStrategies)
+	if selectedCount > 0 {
+		content.WriteString(lipgloss.NewStyle().Foreground(lipgloss.Color("86")).Render(fmt.Sprintf("Selected: %d strategies", selectedCount)) + "\n\n")
+	} else {
+		content.WriteString(helpStyle.Render("No strategies selected") + "\n\n")
+	}
+
 	for i, strategy := range strategies {
 		cursor := "  "
+		checkbox := "[ ]"
+
+		if m.selectedStrategies[strategy.name] {
+			checkbox = "[x]"
+		}
+
 		if i == m.strategyCursor {
 			cursor = "> "
 		}
 
-		line := fmt.Sprintf("%s%-20s %s", cursor, strategy.name, strategy.description)
+		line := fmt.Sprintf("%s%s %-20s %s", cursor, checkbox, strategy.name, strategy.description)
 		if i == m.strategyCursor {
 			line = lipgloss.NewStyle().Foreground(lipgloss.Color("205")).Render(line)
 		}
@@ -2268,6 +2426,7 @@ func (m *model) handleStrategySelectionViewKeys(msg tea.KeyMsg) (tea.Model, tea.
 	switch msg.String() {
 	case "esc":
 		m.currentView = documentImportView
+		m.selectedStrategies = make(map[string]bool) // Clear selections
 		return m, nil
 
 	case "up", "k":
@@ -2280,22 +2439,69 @@ func (m *model) handleStrategySelectionViewKeys(msg tea.KeyMsg) (tea.Model, tea.
 			m.strategyCursor++
 		}
 
+	case " ": // Spacebar to toggle selection
+		strategyName := strategies[m.strategyCursor]
+		if m.selectedStrategies[strategyName] {
+			delete(m.selectedStrategies, strategyName)
+		} else {
+			m.selectedStrategies[strategyName] = true
+		}
+
 	case "enter":
-		// Select strategy and start import
-		m.selectedStrategy = strategies[m.strategyCursor]
+		// Start import with selected strategies
+		if len(m.selectedStrategies) == 0 {
+			return m, nil // Don't start if no strategies selected
+		}
+
 		m.currentView = documentImportView
 		m.importing = true
+		m.importCancelled = false
 		m.importProgress = []string{}
 		m.importProgressChan = make(chan string, 100)
+		m.importCancelChan = make(chan bool, 1)
 
 		if m.importAll {
-			return m, m.importAllDocumentsWithStrategy(m.selectedStrategy)
+			return m, m.importAllDocumentsWithStrategies(m.selectedStrategies)
 		} else {
-			return m, m.importDocumentWithStrategy(m.scannedFiles[m.importCursor], m.selectedStrategy)
+			return m, m.importDocumentWithStrategies(m.scannedFiles[m.importCursor], m.selectedStrategies)
 		}
 	}
 
 	return m, nil
+}
+
+func (m *model) importDocumentWithStrategies(filePath string, strategies map[string]bool) tea.Cmd {
+	return func() tea.Msg {
+		if m.docImporter == nil {
+			m.docImporter = NewDocumentImporter(m.client, m.vectorDB, m.importPath)
+		}
+
+		// Convert map to slice for display
+		strategyList := make([]string, 0, len(strategies))
+		for s := range strategies {
+			strategyList = append(strategyList, s)
+		}
+
+		// Start import in goroutine
+		go func() {
+			m.importProgressChan <- fmt.Sprintf("[1/1] %s (strategies: %v)", filepath.Base(filePath), strategyList)
+
+			for strategy := range strategies {
+				m.importProgressChan <- fmt.Sprintf("  Applying strategy: %s", strategy)
+				err := m.docImporter.ImportDocumentWithStrategy(filePath, m.config.Model, m.config.VectorModel, strategy, false, m.importProgressChan)
+
+				if err != nil {
+					m.importProgressChan <- fmt.Sprintf("  Strategy %s error: %v", strategy, err)
+				}
+			}
+
+			m.importProgressChan <- "Complete!"
+			close(m.importProgressChan)
+		}()
+
+		// Return first message to start the chain
+		return m.waitForImportProgress(m.importProgressChan)()
+	}
 }
 
 func (m *model) importDocumentWithStrategy(filePath string, strategy string) tea.Cmd {
@@ -2314,6 +2520,122 @@ func (m *model) importDocumentWithStrategy(filePath string, strategy string) tea
 			} else {
 				m.importProgressChan <- "Complete!"
 			}
+			close(m.importProgressChan)
+		}()
+
+		// Return first message to start the chain
+		return m.waitForImportProgress(m.importProgressChan)()
+	}
+}
+
+func (m *model) importAllDocumentsWithStrategies(strategies map[string]bool) tea.Cmd {
+	return func() tea.Msg {
+		if m.docImporter == nil {
+			m.docImporter = NewDocumentImporter(m.client, m.vectorDB, m.importPath)
+		}
+
+		totalFiles := len(m.scannedFiles)
+
+		// Convert map to slice for display
+		strategyList := make([]string, 0, len(strategies))
+		for s := range strategies {
+			strategyList = append(strategyList, s)
+		}
+
+		// Start import in goroutine
+		go func() {
+			chunksBefore := len(m.vectorDB.GetAllChunks())
+			imported := 0
+			skipped := 0
+			failed := 0
+
+			// Track stats per strategy
+			strategySuccess := make(map[string]int)
+			strategyFailed := make(map[string]int)
+			strategySkipped := make(map[string]int)
+
+			for i, filePath := range m.scannedFiles {
+				// Check for cancellation
+				select {
+				case <-m.importCancelChan:
+					m.importProgressChan <- "\nImport cancelled by user"
+					time.Sleep(100 * time.Millisecond)
+					close(m.importProgressChan)
+					return
+				default:
+				}
+
+				m.importProgressChan <- fmt.Sprintf("[%d/%d] %s (strategies: %v)", i+1, totalFiles, filepath.Base(filePath), strategyList)
+				fileHadSuccess := false
+
+				for strategy := range strategies {
+					// Check for cancellation before each strategy
+					select {
+					case <-m.importCancelChan:
+						m.importProgressChan <- "\nImport cancelled by user"
+						time.Sleep(100 * time.Millisecond)
+						close(m.importProgressChan)
+						return
+					default:
+					}
+
+					m.importProgressChan <- fmt.Sprintf("  Applying strategy: %s", strategy)
+					err := m.docImporter.ImportDocumentWithStrategy(filePath, m.config.Model, m.config.VectorModel, strategy, false, m.importProgressChan)
+					if err != nil {
+						if strings.Contains(err.Error(), "already imported") {
+							skipped++
+							strategySkipped[strategy]++
+						} else {
+							failed++
+							strategyFailed[strategy]++
+							m.importProgressChan <- fmt.Sprintf("  Strategy %s error: %v", strategy, err)
+						}
+					} else {
+						strategySuccess[strategy]++
+						fileHadSuccess = true
+					}
+				}
+				if fileHadSuccess {
+					imported++
+				}
+			}
+
+			chunksAfter := len(m.vectorDB.GetAllChunks())
+			newChunks := chunksAfter - chunksBefore
+
+			// Build detailed summary
+			var summaryBuilder strings.Builder
+			summaryBuilder.WriteString("\n========================================\n")
+			summaryBuilder.WriteString("Import Summary\n")
+			summaryBuilder.WriteString("========================================\n")
+			summaryBuilder.WriteString(fmt.Sprintf("Files: %d imported, %d skipped, %d failed\n", imported, skipped, failed))
+			summaryBuilder.WriteString(fmt.Sprintf("New chunks created: %d\n", newChunks))
+			summaryBuilder.WriteString("\nStrategy Breakdown:\n")
+
+			// Sort strategies for consistent display
+			sortedStrategies := make([]string, 0, len(strategies))
+			for s := range strategies {
+				sortedStrategies = append(sortedStrategies, s)
+			}
+			sort.Strings(sortedStrategies)
+
+			for _, strategy := range sortedStrategies {
+				success := strategySuccess[strategy]
+				skippedCount := strategySkipped[strategy]
+				failedCount := strategyFailed[strategy]
+				total := success + skippedCount + failedCount
+
+				summaryBuilder.WriteString(fmt.Sprintf("  %-20s %d success, %d skipped, %d failed (of %d)\n",
+					strategy+":", success, skippedCount, failedCount, total))
+			}
+			summaryBuilder.WriteString("========================================\n")
+			summaryBuilder.WriteString("\nPress ESC to continue...")
+
+			m.importProgressChan <- summaryBuilder.String()
+
+			// Keep summary visible - don't close channel immediately
+			// The channel will be closed when user presses ESC
+			time.Sleep(5 * time.Second)
 			close(m.importProgressChan)
 		}()
 

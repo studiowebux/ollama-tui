@@ -43,6 +43,7 @@ func launchTUI() {
 	p := tea.NewProgram(
 		initialModel(storage, client, config, vectorDB, projectManager),
 		tea.WithAltScreen(),
+		tea.WithMouseAllMotion(),
 	)
 
 	if _, err := p.Run(); err != nil {

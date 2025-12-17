@@ -520,6 +520,16 @@ func (db *VectorDB) HasDocumentHash(hash string) bool {
 	return false
 }
 
+// HasDocumentHashWithStrategy checks if a document with this hash and strategy combination has already been imported
+func (db *VectorDB) HasDocumentHashWithStrategy(hash string, strategy string) bool {
+	for _, chunk := range db.chunks {
+		if chunk.Metadata.DocumentHash == hash && string(chunk.Strategy) == strategy {
+			return true
+		}
+	}
+	return false
+}
+
 // RemoveChunksByDocumentHash removes all chunks associated with a document hash
 func (db *VectorDB) RemoveChunksByDocumentHash(hash string) int {
 	removed := 0
