@@ -22,6 +22,7 @@ const (
 	settingsView
 	vectorStatsView
 	confirmResetView
+	confirmDeleteChatView
 	projectSwitcherView
 	knowledgeBaseView
 	chunkDetailView
@@ -109,6 +110,9 @@ type model struct {
 	refinementStatus  string // Current refinement status message
 	lastRAGResult     *RAGResult // Last RAG result for refinement
 	lastUserQuery     string     // Last user query for refinement
+
+	// Delete confirmation
+	chatToDelete *Chat // Chat pending deletion
 }
 
 type streamChunkMsg string
@@ -267,6 +271,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.handleRefineDiffViewKeys(msg)
 		case confirmResetView:
 			return m.handleConfirmResetViewKeys(msg)
+		case confirmDeleteChatView:
+			return m.handleConfirmDeleteChatViewKeys(msg)
 		case documentImportView:
 			return m.handleDocumentImportViewKeys(msg)
 		case strategySelectionView:
@@ -481,6 +487,8 @@ func (m model) View() string {
 		return m.renderVectorStatsView()
 	case confirmResetView:
 		return m.renderConfirmResetView()
+	case confirmDeleteChatView:
+		return m.renderConfirmDeleteChatView()
 	case projectSwitcherView:
 		return m.renderProjectSwitcherView()
 	case knowledgeBaseView:
@@ -705,6 +713,13 @@ func (m *model) handleChatViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, tea.Quit
 	}
 	if msg.Type == tea.KeyEsc {
+		// If in rating mode, cancel it instead of leaving chat
+		if m.pendingRating {
+			m.pendingRating = false
+			m.updateViewport()
+			return m, nil
+		}
+		// Otherwise, go back to chat list
 		m.currentView = chatListView
 		return m, m.loadChats
 	}
@@ -770,13 +785,6 @@ func (m *model) handleChatViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, m.rateMessage(m.pendingRatingIndex, score)
 	}
 
-	// Cancel rating with Esc
-	if m.pendingRating && msg.Type == tea.KeyEsc {
-		m.pendingRating = false
-		m.updateViewport()
-		return m, nil
-	}
-
 	// Handle enter for sending messages
 	if msg.Type == tea.KeyEnter {
 		if m.streaming || m.pendingRating {
@@ -830,12 +838,9 @@ func (m *model) handleChatListViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "d":
 		if len(m.chats) > 0 {
-			chat := m.chats[m.chatListCursor]
-			m.storage.DeleteChat(chat.ID)
-			if m.currentChat != nil && m.currentChat.ID == chat.ID {
-				m.currentChat = nil
-			}
-			return m, m.loadChats
+			m.chatToDelete = m.chats[m.chatListCursor]
+			m.currentView = confirmDeleteChatView
+			return m, nil
 		}
 
 	case "s":
@@ -2034,6 +2039,50 @@ func (m model) renderConfirmResetView() string {
 	content.WriteString(infoStyle.Render("Preserved:") + "\n\n")
 	content.WriteString("  - Configuration settings\n")
 	content.WriteString("  - Backups (if any)\n\n")
+
+	content.WriteString(errorStyle.Render("This action cannot be undone!") + "\n\n")
+	content.WriteString(help)
+
+	return content.String()
+}
+
+func (m *model) handleConfirmDeleteChatViewKeys(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "y", "Y":
+		// Perform delete
+		if m.chatToDelete != nil {
+			m.storage.DeleteChat(m.chatToDelete.ID)
+			if m.currentChat != nil && m.currentChat.ID == m.chatToDelete.ID {
+				m.currentChat = nil
+			}
+			m.chatToDelete = nil
+		}
+		m.currentView = chatListView
+		return m, m.loadChats
+
+	case "n", "N", "esc", "q":
+		m.chatToDelete = nil
+		m.currentView = chatListView
+		return m, nil
+	}
+	return m, nil
+}
+
+func (m model) renderConfirmDeleteChatView() string {
+	title := errorStyle.Render("DELETE CHAT")
+	help := helpStyle.Render("y: confirm delete | n/esc: cancel")
+
+	var content strings.Builder
+	content.WriteString(title + "\n\n")
+
+	warningStyle := lipgloss.NewStyle().Foreground(lipgloss.Color("214")).Bold(true)
+	content.WriteString(warningStyle.Render("Are you sure you want to delete this chat?") + "\n\n")
+
+	if m.chatToDelete != nil {
+		chatInfo := lipgloss.NewStyle().Foreground(lipgloss.Color("86"))
+		content.WriteString(chatInfo.Render("Chat: ") + m.chatToDelete.Title + "\n")
+		content.WriteString(chatInfo.Render("Messages: ") + fmt.Sprintf("%d", len(m.chatToDelete.Messages)) + "\n\n")
+	}
 
 	content.WriteString(errorStyle.Render("This action cannot be undone!") + "\n\n")
 	content.WriteString(help)
